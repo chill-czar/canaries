@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/playwright-community/playwright-go"
 	"github.com/superserve-ai/canaries/internal/config"
 	"github.com/superserve-ai/canaries/internal/lock"
 	"github.com/superserve-ai/canaries/internal/metrics"
@@ -137,7 +138,12 @@ func setupMockConsoleServer() *httptest.Server {
       if (e.key === 'Enter') {
         var lines = document.querySelector('.xterm-rows');
         var div = document.createElement('div');
-        div.innerText = ta.value;
+        var val = ta.value;
+        if (val.indexOf('$((1234 + 5678))') !== -1) {
+          div.innerText = val.replace('$((1234 + 5678))', '6912');
+        } else {
+          div.innerText = val;
+        }
         lines.appendChild(div);
       }
     });
@@ -149,7 +155,25 @@ func setupMockConsoleServer() *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
+func skipIfPlaywrightUnavailable(t *testing.T) {
+	t.Helper()
+	pw, err := playwright.Run()
+	if err != nil {
+		t.Skipf("skipping browser test: playwright driver unavailable: %v", err)
+		return
+	}
+	defer pw.Stop()
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Headless: playwright.Bool(true)})
+	if err != nil {
+		t.Skipf("skipping browser test: chromium browser unavailable: %v", err)
+		return
+	}
+	_ = browser.Close()
+}
+
 func TestUIRunnerWithMockServer(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
 	server := setupMockConsoleServer()
 	defer server.Close()
 
@@ -195,6 +219,8 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 }
 
 func TestAuthenticateInvalidCredentials(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
 	server := setupMockConsoleServer()
 	defer server.Close()
 

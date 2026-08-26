@@ -131,6 +131,9 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	target := r.Config.BaseConfig.Target
 	scenario := "ui-lifecycle"
 
+	_ = playwright.Install(&playwright.RunOptions{
+		SkipInstallBrowsers: true,
+	})
 	pw, err := playwright.Run()
 	if err != nil {
 		res.Err = fmt.Errorf("initialize playwright: %w", err)
@@ -188,6 +191,20 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	stepTimeout := r.Config.StepTimeout
 	stepTimeoutMs := float64(stepTimeout.Milliseconds())
 
+	var (
+		createdSandboxID   string
+		createdSandboxName string
+		sandboxDeleted     bool
+	)
+
+	// Guaranteed deferred cleanup if sandbox was created but not successfully deleted
+	defer func() {
+		if createdSandboxID != "" && !sandboxDeleted {
+			log.Info().Str("sandbox_id", createdSandboxID).Str("sandbox_name", createdSandboxName).Msg("executing deferred sandbox cleanup on failure/exit")
+			_ = r.deleteSandboxInUI(page, createdSandboxID, createdSandboxName, stepTimeoutMs)
+		}
+	}()
+
 	// Step 1: Authenticate
 	authStart := r.now()
 	log.Info().Msg("UI step: authenticate")
@@ -204,7 +221,8 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	createStart := r.now()
 	log.Info().Msg("UI step: create_sandbox")
 	sandboxName := fmt.Sprintf("ui-canary-%d", r.now().Unix())
-	createdSandboxID, err := r.createSandboxInUI(page, sandboxName, stepTimeoutMs)
+	createdSandboxName = sandboxName
+	sbID, err := r.createSandboxInUI(page, sandboxName, stepTimeoutMs)
 	if err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "failure", r.now().Sub(createStart))
 		captureArtifacts("create_sandbox")
@@ -212,20 +230,18 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		res.FailedStep = "create_sandbox"
 		return res
 	}
+	createdSandboxID = sbID
 	res.SandboxID = createdSandboxID
 	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
 
 	// Step 3: Interactive Terminal Execution
 	termStart := r.now()
 	log.Info().Msg("UI step: terminal_exec")
-	termToken := fmt.Sprintf("UI_TOKEN_%s", runID)
-	if err := r.executeTerminalCommand(page, res.SandboxID, termToken, r.Config.TerminalTimeout); err != nil {
+	if err := r.executeTerminalCommand(page, res.SandboxID, r.Config.TerminalTimeout); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "terminal_exec", "failure", r.now().Sub(termStart))
 		captureArtifacts("terminal_exec")
 		res.Err = fmt.Errorf("terminal execution: %w", err)
 		res.FailedStep = "terminal_exec"
-		// Attempt best-effort cleanup on terminal failure
-		_ = r.deleteSandboxInUI(page, res.SandboxID, sandboxName, stepTimeoutMs)
 		return res
 	}
 	mp.RecordStep(ctx, env, region, target, scenario, "terminal_exec", "success", r.now().Sub(termStart))
@@ -238,7 +254,6 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		captureArtifacts("pause_sandbox")
 		res.Err = fmt.Errorf("pause sandbox: %w", err)
 		res.FailedStep = "pause_sandbox"
-		_ = r.deleteSandboxInUI(page, res.SandboxID, sandboxName, stepTimeoutMs)
 		return res
 	}
 	mp.RecordStep(ctx, env, region, target, scenario, "pause_sandbox", "success", r.now().Sub(pauseStart))
@@ -251,7 +266,6 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		captureArtifacts("resume_sandbox")
 		res.Err = fmt.Errorf("resume sandbox: %w", err)
 		res.FailedStep = "resume_sandbox"
-		_ = r.deleteSandboxInUI(page, res.SandboxID, sandboxName, stepTimeoutMs)
 		return res
 	}
 	mp.RecordStep(ctx, env, region, target, scenario, "resume_sandbox", "success", r.now().Sub(resumeStart))
@@ -266,6 +280,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		res.FailedStep = "delete_sandbox"
 		return res
 	}
+	sandboxDeleted = true
 	mp.RecordStep(ctx, env, region, target, scenario, "delete_sandbox", "success", r.now().Sub(deleteStart))
 
 	return res
@@ -358,6 +373,22 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	// 3. Fallback: navigate directly to sandboxes list and find row
+	if sandboxID == "" {
+		listURL := fmt.Sprintf("%s/sandboxes/", r.Config.ConsoleURL)
+		_, _ = page.Goto(listURL, playwright.PageGotoOptions{
+			Timeout:   playwright.Float(timeoutMs),
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+		})
+		time.Sleep(1 * time.Second)
+		row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName)).First()
+		if count, _ := row.Count(); count > 0 {
+			_ = row.Click()
+			time.Sleep(500 * time.Millisecond)
+			sandboxID = extractSandboxIDFromURL(page.URL())
+		}
+	}
+
 	if sandboxID == "" {
 		return "", fmt.Errorf("could not extract sandbox ID after creation")
 	}
@@ -385,7 +416,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 	return sandboxID, nil
 }
 
-func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID, token string, timeout time.Duration) error {
+func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, timeout time.Duration) error {
 	timeoutMs := float64(timeout.Milliseconds())
 
 	// Navigate to terminal page if not already there
@@ -419,20 +450,21 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID, token st
 				while (fiber) {
 					let hook = fiber.memoizedState;
 					while (hook) {
-						if (hook.memoizedState && hook.memoizedState.current) {
-							const val = hook.memoizedState.current;
-							if (typeof val.serialize === 'function') {
-								try { return val.serialize(); } catch (e) {}
-							}
-							if (val.buffer && val.buffer.active) {
-								try {
+						if (hook.memoizedState && typeof hook.memoizedState === 'object') {
+							const state = hook.memoizedState;
+							if (state.current) {
+								if (typeof state.current.serialize === 'function') {
+									try { return state.current.serialize(); } catch (e) {}
+								}
+								if (state.current.buffer && state.current.buffer.active) {
+									const buf = state.current.buffer.active;
 									let lines = [];
-									for (let i = 0; i < val.buffer.active.length; i++) {
-										const l = val.buffer.active.getLine(i);
-										if (l) lines.push(l.translateToString(true));
+									for (let i = 0; i < buf.length; i++) {
+										const line = buf.getLine(i);
+										if (line) lines.push(line.translateToString(true));
 									}
 									return lines.join('\n');
-								} catch (e) {}
+								}
 							}
 						}
 						hook = hook.next;
@@ -502,10 +534,15 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID, token st
 	focusTerminal()
 	time.Sleep(500 * time.Millisecond)
 
+	// Generate arithmetic transformation operands so typed keystrokes cannot false-positive match the evaluated output
+	nonceA := 1234
+	nonceB := 5678
+	expectedOutput := fmt.Sprintf("RES_UI_%d", nonceA+nonceB)
+	cmd := fmt.Sprintf("echo RES_UI_$((%d + %d))", nonceA, nonceB)
+
 	// Send echo command function
 	sendCommand := func() error {
 		focusTerminal()
-		cmd := fmt.Sprintf("echo %s", token)
 		if err := page.Keyboard().Type(cmd, playwright.KeyboardTypeOptions{Delay: playwright.Float(30)}); err != nil {
 			return fmt.Errorf("type command to terminal: %w", err)
 		}
@@ -520,17 +557,17 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID, token st
 		return err
 	}
 
-	// Poll terminal until token appears, retrying command once if needed
+	// Poll terminal until transformed output appears, retrying command once if needed
 	pollDeadline := r.now().Add(timeout)
 	lastRetry := r.now()
 	for r.now().Before(pollDeadline) {
 		text := extractTerminalText()
-		if strings.Contains(text, token) {
-			log.Info().Str("token", token).Msg("terminal verification verified token output")
+		if strings.Contains(text, expectedOutput) {
+			log.Info().Str("expected_output", expectedOutput).Msg("terminal verification verified transformed shell output")
 			return nil
 		}
 
-		// If 5 seconds passed without seeing the token or prompt, try typing once more (e.g. if a reconnect occurred)
+		// If 5 seconds passed without seeing the output, try typing once more (e.g. if a reconnect occurred)
 		if r.now().Sub(lastRetry) > 5*time.Second {
 			_ = sendCommand()
 			lastRetry = r.now()
@@ -539,7 +576,7 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID, token st
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	return fmt.Errorf("terminal output did not contain expected verification token %q within timeout", token)
+	return fmt.Errorf("terminal output did not contain expected transformed sentinel %q within timeout", expectedOutput)
 }
 
 func (r Runner) pauseSandboxInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {

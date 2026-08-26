@@ -22,7 +22,10 @@ type Config struct {
 }
 
 func LoadConfig(baseCfg config.Config) (Config, error) {
-	consoleURL := strings.TrimRight(envDefault("CANARY_UI_URL", "https://console.superserve.ai"), "/")
+	consoleURL := strings.TrimRight(envDefault("CANARY_UI_CONSOLE_URL", os.Getenv("CANARY_UI_URL")), "/")
+	if consoleURL == "" {
+		return Config{}, errors.New("CANARY_UI_CONSOLE_URL is required")
+	}
 
 	email := envDefault("CANARY_UI_EMAIL", os.Getenv("CANARY_UI_USERNAME"))
 	password := os.Getenv("CANARY_UI_PASSWORD")

@@ -100,12 +100,9 @@ func Load(rawMode string) (Config, error) {
 
 	lockBackend := LockBackend(strings.TrimSpace(os.Getenv("CANARY_LOCK_BACKEND")))
 	if lockBackend == "" {
-		switch {
-		case mode == ModeUILifecycle:
-			lockBackend = LockBackendNone
-		case runtime == RuntimeCloudRun:
+		if runtime == RuntimeCloudRun {
 			lockBackend = LockBackendGCS
-		default:
+		} else {
 			lockBackend = LockBackendFile
 		}
 	}
@@ -233,13 +230,13 @@ func Load(rawMode string) (Config, error) {
 		if cfg.MetricsExporter != MetricsExporterOTLP {
 			return Config{}, fmt.Errorf("CANARY_RUNTIME=cloud-run requires CANARY_METRICS_EXPORTER=otlp")
 		}
-		if cfg.LockBackend != LockBackendGCS && cfg.Mode != ModeUILifecycle {
+		if cfg.LockBackend != LockBackendGCS {
 			return Config{}, fmt.Errorf("CANARY_RUNTIME=cloud-run requires CANARY_LOCK_BACKEND=gcs")
 		}
 		if cfg.OTELExporterOTLPMetricsEndpoint == "" {
 			return Config{}, fmt.Errorf("CANARY_RUNTIME=cloud-run requires OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT")
 		}
-		if cfg.LockBucket == "" && cfg.Mode != ModeUILifecycle {
+		if cfg.LockBucket == "" {
 			return Config{}, fmt.Errorf("CANARY_RUNTIME=cloud-run requires LOCK_BUCKET")
 		}
 	case RuntimeLocal:

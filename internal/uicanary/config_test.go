@@ -8,10 +8,9 @@ import (
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
+	t.Setenv("CANARY_UI_CONSOLE_URL", "https://console.staging.superserve.ai")
 	t.Setenv("CANARY_UI_EMAIL", "test@superserve.ai")
 	t.Setenv("CANARY_UI_PASSWORD", "secret123")
-	t.Setenv("CANARY_UI_URL", "")
-	t.Setenv("UI_CANARY_BASE_URL", "")
 	t.Setenv("CANARY_UI_HEADLESS", "")
 
 	base := config.Config{
@@ -26,8 +25,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.ConsoleURL != "https://console.superserve.ai" {
-		t.Errorf("expected default console url https://console.superserve.ai, got %s", cfg.ConsoleURL)
+	if cfg.ConsoleURL != "https://console.staging.superserve.ai" {
+		t.Errorf("expected console url https://console.staging.superserve.ai, got %s", cfg.ConsoleURL)
 	}
 	if cfg.Email != "test@superserve.ai" || cfg.Password != "secret123" {
 		t.Errorf("unexpected credentials: %s / %s", cfg.Email, cfg.Password)
@@ -65,6 +64,7 @@ func TestLoadConfigCustom(t *testing.T) {
 }
 
 func TestLoadConfigUsernameFallback(t *testing.T) {
+	t.Setenv("CANARY_UI_CONSOLE_URL", "http://localhost:3000")
 	t.Setenv("CANARY_UI_EMAIL", "")
 	t.Setenv("CANARY_UI_USERNAME", "legacy@superserve.ai")
 	t.Setenv("CANARY_UI_PASSWORD", "secret123")
@@ -80,20 +80,22 @@ func TestLoadConfigUsernameFallback(t *testing.T) {
 }
 
 func TestLoadConfigValidation(t *testing.T) {
+	t.Setenv("CANARY_UI_CONSOLE_URL", "")
+	t.Setenv("CANARY_UI_URL", "")
 	t.Setenv("CANARY_UI_EMAIL", "")
 	t.Setenv("CANARY_UI_USERNAME", "")
 	t.Setenv("CANARY_UI_PASSWORD", "")
-	t.Setenv("UI_CANARY_PASSWORD", "")
 
 	base := config.Config{}
 
-	// No credentials
+	// Missing console URL
 	_, err := LoadConfig(base)
 	if err == nil {
-		t.Errorf("expected error when credentials are missing")
+		t.Errorf("expected error when console URL is missing")
 	}
 
 	// Missing password
+	t.Setenv("CANARY_UI_CONSOLE_URL", "http://localhost:3000")
 	t.Setenv("CANARY_UI_EMAIL", "user@test.com")
 	_, err = LoadConfig(base)
 	if err == nil {

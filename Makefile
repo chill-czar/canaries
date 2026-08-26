@@ -30,6 +30,7 @@ run-ui:
 	CANARY_RUNTIME=$${CANARY_RUNTIME:-local} \
 	CANARY_METRICS_EXPORTER=$${CANARY_METRICS_EXPORTER:-none} \
 	CANARY_LOCK_BACKEND=$${CANARY_LOCK_BACKEND:-none} \
+	CANARY_UI_CONSOLE_URL=$${CANARY_UI_CONSOLE_URL:-$${CANARY_UI_URL}} \
 	$(GO) run ./cmd/ui-canary
 
 ## test: Run all tests in the repository

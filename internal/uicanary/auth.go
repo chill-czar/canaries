@@ -12,7 +12,7 @@ import (
 
 // Authenticate executes the email & password sign-in flow on the Superserve console.
 func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
-	log.Info().Str("email", cfg.Email).Msg("authenticating UI canary via email/password form")
+	log.Info().Str("email", maskEmail(cfg.Email)).Msg("authenticating UI canary via email/password form")
 
 	signinURL := cfg.ConsoleURL + "/auth/signin"
 	if _, err := page.Goto(signinURL, playwright.PageGotoOptions{
@@ -89,4 +89,16 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 		return nil
 	}
 	return fmt.Errorf("sign in failed, still on %s", page.URL())
+}
+
+func maskEmail(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return "***"
+	}
+	name, domain := parts[0], parts[1]
+	if len(name) <= 2 {
+		return "***@" + domain
+	}
+	return name[:1] + "***" + name[len(name)-1:] + "@" + domain
 }

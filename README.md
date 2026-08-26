@@ -18,8 +18,9 @@ Each target has its own:
 - independent alert policy
 
 The canary binary supports:
-- `lifecycle`
-- `janitor`
+- `lifecycle` (API lifecycle canary)
+- `janitor` (API orphan cleanup)
+- `ui-lifecycle` (Headless browser UI lifecycle canary)
 
 ## Architecture
 
@@ -39,6 +40,72 @@ The janitor:
 1. lists canary-owned sandboxes for the environment
 2. deletes stale resources past TTL
 3. emits orphan and deletion metrics
+
+## UI Canary
+
+The UI canary runs automated end-to-end browser journeys against the Superserve web console using Playwright in headless Chromium.
+
+### UI Lifecycle Scenario
+Per run it:
+1. **Authenticates**: Submits operator email and password on `/auth/signin`, verifies session cookie creation and navigates to `/sandboxes/`.
+2. **Creates Sandbox**: Opens create dialog with a timestamped sandbox name (`ui-canary-<unix>`) and asserts the **Active** status badge.
+3. **Interactive Terminal Execution**: Opens the web terminal (xterm.js), evaluates an arithmetic expression in bash (`echo RES_UI_$((1234 + 5678))`), and verifies computed output (`RES_UI_6912`) to eliminate false positives from keystroke echoing.
+4. **Pauses Sandbox**: Clicks Stop and asserts the **Paused** status badge.
+5. **Resumes Sandbox**: Clicks Start and asserts the **Active** status badge.
+6. **Deletes Sandbox**: Confirms deletion dialog, waits for the dialog to dismiss and verifies the sandbox is removed from the sandboxes table. Guaranteed deferred cleanup automatically recovers and reaps sandboxes on intermediate failures.
+
+### UI Canary Environment Variables
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `CANARY_UI_CONSOLE_URL` | **Yes** | — | Target Superserve Console URL (e.g. `https://console.staging.superserve.ai` or `http://localhost:3000`) |
+| `CANARY_UI_EMAIL` | **Yes** | — | Canary operator login email |
+| `CANARY_UI_PASSWORD` | **Yes** | — | Canary operator login password |
+| `CANARY_UI_HEADLESS` | No | `true` | Run browser in headless mode (`true` or `false`) |
+| `CANARY_UI_STEP_TIMEOUT` | No | `45s` | Timeout for UI navigation and status assertion steps |
+| `CANARY_UI_TERMINAL_TIMEOUT` | No | `30s` | Timeout for terminal connection and command execution |
+| `CANARY_UI_ARTIFACTS_DIR` | No | `/tmp/ui-canary-artifacts` | Directory for failure screenshots |
+
+### Local UI Canary Execution
+
+Run with `make run-ui` (reads credentials and console URL from `.env` or environment):
+
+```bash
+export CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai
+export CANARY_UI_EMAIL=canary@superserve.ai
+export CANARY_UI_PASSWORD=secret123
+
+make run-ui
+```
+
+### Container Build & Docker Execution
+
+Build the standalone UI Canary image (includes Playwright Chromium runtime and Go driver cache):
+
+```bash
+make docker-build-ui
+
+docker run --rm \
+  -e CANARY_TARGET=staging-us-central1 \
+  -e CANARY_ENVIRONMENT=staging \
+  -e CANARY_REGION=us-central1 \
+  -e CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai \
+  -e CANARY_UI_EMAIL=canary@superserve.ai \
+  -e CANARY_UI_PASSWORD=secret123 \
+  superserve/ui-canary:latest
+```
+
+### Cloud Run Deployment
+
+On Cloud Run (`CANARY_RUNTIME=cloud-run`), the UI canary requires OTLP telemetry and GCS target locking:
+
+```bash
+gcloud run jobs create ui-canary-staging-us-central1 \
+  --image=superserve/ui-canary:latest \
+  --region=us-central1 \
+  --set-env-vars=CANARY_RUNTIME=cloud-run,CANARY_METRICS_EXPORTER=otlp,CANARY_LOCK_BACKEND=gcs,LOCK_BUCKET=canary-locks,CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai \
+  --set-secrets=CANARY_UI_EMAIL=ui-canary-email:latest,CANARY_UI_PASSWORD=ui-canary-password:latest
+```
 
 ## Target Inventory
 

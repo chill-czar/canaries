@@ -14,13 +14,23 @@ import (
 
 	"github.com/superserve-ai/canaries/internal/lock"
 	"github.com/superserve-ai/canaries/internal/metrics"
+	"github.com/superserve-ai/canaries/internal/sandboxmetadata"
 )
+
+// SandboxTagger is an optional dependency for tagging sandbox ownership metadata
+// via the API immediately after the sandbox ID is recovered from the browser URL.
+// This ensures the janitor can discover and reap sandboxes that leak if a run
+// crashes before reaching the delete step.
+type SandboxTagger interface {
+	TagSandbox(ctx context.Context, sandboxID string, metadata map[string]string) error
+}
 
 type Runner struct {
 	Config  Config
 	Locker  lock.Lock
 	Metrics metrics.Provider
 	Clock   func() time.Time
+	Tagger  SandboxTagger // optional; if nil, metadata tagging is skipped
 }
 
 type RunResult struct {
@@ -232,6 +242,23 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	}
 	createdSandboxID = sbID
 	res.SandboxID = createdSandboxID
+
+	// Tag the sandbox with ownership metadata so the janitor can reap it if this
+	// run crashes before the delete step. Best-effort: a tagging failure is logged
+	// but does not fail the canary run.
+	if r.Tagger != nil {
+		tagMeta := sandboxmetadata.LegacyCanaryMetadata(
+			env, region, target, runID,
+			r.now(),
+			r.now().Add(r.Config.BaseConfig.RetainFailedSandboxTTL),
+		)
+		if tagErr := r.Tagger.TagSandbox(ctx, createdSandboxID, tagMeta); tagErr != nil {
+			log.Warn().Err(tagErr).Str("sandbox_id", createdSandboxID).Msg("failed to tag sandbox metadata; janitor cannot reap it if run fails")
+		} else {
+			log.Debug().Str("sandbox_id", createdSandboxID).Msg("sandbox tagged with canary ownership metadata")
+		}
+	}
+
 	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
 
 	// Step 3: Interactive Terminal Execution

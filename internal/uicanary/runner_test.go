@@ -13,6 +13,7 @@ import (
 	"github.com/superserve-ai/canaries/internal/config"
 	"github.com/superserve-ai/canaries/internal/lock"
 	"github.com/superserve-ai/canaries/internal/metrics"
+	"github.com/superserve-ai/canaries/internal/sandboxmetadata"
 )
 
 func TestExtractSandboxIDFromURL(t *testing.T) {
@@ -201,11 +202,22 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 		TerminalTimeout: 5 * time.Second,
 	}
 
+	var taggedSandboxID string
+	var taggedMetadata map[string]string
+	mockTagger := &mockSandboxTagger{
+		tagFn: func(ctx context.Context, sandboxID string, metadata map[string]string) error {
+			taggedSandboxID = sandboxID
+			taggedMetadata = metadata
+			return nil
+		},
+	}
+
 	runner := Runner{
 		Config:  cfg,
 		Locker:  lock.NoopLock{},
 		Metrics: metrics.NoopProvider{},
 		Clock:   time.Now,
+		Tagger:  mockTagger,
 	}
 
 	// This integration test runs if playwright browser is available
@@ -216,6 +228,24 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Runner failed with email/password auth: %v", err)
 	}
+
+	if taggedSandboxID != "sb-mock-123" {
+		t.Errorf("expected taggedSandboxID 'sb-mock-123', got %q", taggedSandboxID)
+	}
+	if taggedMetadata[sandboxmetadata.KeyManagedBy] != sandboxmetadata.ManagedByCanaryLegacy {
+		t.Errorf("expected managed_by %q, got %q", sandboxmetadata.ManagedByCanaryLegacy, taggedMetadata[sandboxmetadata.KeyManagedBy])
+	}
+}
+
+type mockSandboxTagger struct {
+	tagFn func(ctx context.Context, sandboxID string, metadata map[string]string) error
+}
+
+func (m *mockSandboxTagger) TagSandbox(ctx context.Context, sandboxID string, metadata map[string]string) error {
+	if m.tagFn != nil {
+		return m.tagFn(ctx, sandboxID, metadata)
+	}
+	return nil
 }
 
 func TestAuthenticateInvalidCredentials(t *testing.T) {

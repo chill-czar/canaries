@@ -2,6 +2,7 @@ package uicanary
 
 import (
 	"errors"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,20 +12,25 @@ import (
 )
 
 type Config struct {
-	BaseConfig      config.Config
-	ConsoleURL      string
-	Email           string
-	Password        string
-	Headless        bool
-	ArtifactsDir    string
-	StepTimeout     time.Duration
-	TerminalTimeout time.Duration
+	BaseConfig             config.Config
+	ConsoleURL             string
+	Email                  string
+	Password               string
+	Headless               bool
+	ArtifactsDir           string
+	StepTimeout            time.Duration
+	TerminalTimeout        time.Duration
+	VercelProtectionBypass string
 }
 
 func LoadConfig(baseCfg config.Config) (Config, error) {
 	consoleURL := strings.TrimRight(envDefault("CANARY_UI_CONSOLE_URL", os.Getenv("CANARY_UI_URL")), "/")
 	if consoleURL == "" {
-		return Config{}, errors.New("CANARY_UI_CONSOLE_URL is required")
+		return Config{}, errors.New("console URL is required (set CANARY_UI_CONSOLE_URL)")
+	}
+	parsedURL, err := url.ParseRequestURI(consoleURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return Config{}, errors.New("CANARY_UI_CONSOLE_URL must be a valid HTTP or HTTPS URL")
 	}
 
 	email := envDefault("CANARY_UI_EMAIL", os.Getenv("CANARY_UI_USERNAME"))
@@ -41,16 +47,18 @@ func LoadConfig(baseCfg config.Config) (Config, error) {
 	artifactsDir := envDefault("CANARY_UI_ARTIFACTS_DIR", "/tmp/ui-canary-artifacts")
 	stepTimeout := getenvDuration("CANARY_UI_STEP_TIMEOUT", 45*time.Second)
 	terminalTimeout := getenvDuration("CANARY_UI_TERMINAL_TIMEOUT", 30*time.Second)
+	vercelBypass := strings.TrimSpace(os.Getenv("CANARY_UI_VERCEL_PROTECTION_BYPASS"))
 
 	return Config{
-		BaseConfig:      baseCfg,
-		ConsoleURL:      consoleURL,
-		Email:           email,
-		Password:        password,
-		Headless:        headless,
-		ArtifactsDir:    artifactsDir,
-		StepTimeout:     stepTimeout,
-		TerminalTimeout: terminalTimeout,
+		BaseConfig:             baseCfg,
+		ConsoleURL:             consoleURL,
+		Email:                  email,
+		Password:               password,
+		Headless:               headless,
+		ArtifactsDir:           artifactsDir,
+		StepTimeout:            stepTimeout,
+		TerminalTimeout:        terminalTimeout,
+		VercelProtectionBypass: vercelBypass,
 	}, nil
 }
 

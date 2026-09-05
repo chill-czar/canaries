@@ -49,7 +49,7 @@ The UI canary runs automated end-to-end browser journeys against the Superserve 
 Per run it:
 1. **Authenticates**: Submits operator email and password on `/auth/signin`, verifies session cookie creation and navigates to `/sandboxes/`.
 2. **Creates Sandbox**: Opens create dialog with a timestamped sandbox name (`ui-canary-<unix>`) and asserts the **Active** status badge.
-3. **Interactive Terminal Execution**: Opens the web terminal (xterm.js), evaluates an arithmetic expression in bash (`echo RES_UI_$((1234 + 5678))`), and verifies computed output (`RES_UI_6912`) to eliminate false positives from keystroke echoing.
+3. **Interactive Terminal Execution**: Opens the web terminal (xterm.js), evaluates a dynamic arithmetic expression in bash (`echo "RES_UI_$((<nonceA> + <nonceB>))"` with random 4-digit nonces), and verifies the computed sum (`RES_UI_<sum>`) to eliminate false positives from keystroke echoing or hardcoded outputs.
 4. **Pauses Sandbox**: Clicks Stop and asserts the **Paused** status badge.
 5. **Resumes Sandbox**: Clicks Start and asserts the **Active** status badge.
 6. **Deletes Sandbox**: Confirms deletion dialog, waits for the dialog to dismiss and verifies the sandbox is removed from the sandboxes table. Guaranteed deferred cleanup automatically recovers and reaps sandboxes on intermediate failures.
@@ -61,6 +61,7 @@ Per run it:
 | `CANARY_UI_CONSOLE_URL` | **Yes** | — | Target Superserve Console URL (e.g. `https://console.staging.superserve.ai` or `http://localhost:3000`) |
 | `CANARY_UI_EMAIL` | **Yes** | — | Canary operator login email |
 | `CANARY_UI_PASSWORD` | **Yes** | — | Canary operator login password |
+| `CANARY_UI_VERCEL_PROTECTION_BYPASS` | No | — | Vercel deployment protection bypass secret (injected via `x-vercel-protection-bypass` and `x-vercel-set-bypass-cookie: true` headers; never embed in `CANARY_UI_CONSOLE_URL`) |
 | `CANARY_UI_HEADLESS` | No | `true` | Run browser in headless mode (`true` or `false`) |
 | `CANARY_UI_STEP_TIMEOUT` | No | `45s` | Timeout for UI navigation and status assertion steps |
 | `CANARY_UI_TERMINAL_TIMEOUT` | No | `30s` | Timeout for terminal connection and command execution |
@@ -103,8 +104,8 @@ On Cloud Run (`CANARY_RUNTIME=cloud-run`), the UI canary requires OTLP telemetry
 gcloud run jobs create ui-canary-staging-us-central1 \
   --image=superserve/ui-canary:latest \
   --region=us-central1 \
-  --set-env-vars=CANARY_RUNTIME=cloud-run,CANARY_METRICS_EXPORTER=otlp,CANARY_LOCK_BACKEND=gcs,LOCK_BUCKET=canary-locks,CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai \
-  --set-secrets=CANARY_UI_EMAIL=ui-canary-email:latest,CANARY_UI_PASSWORD=ui-canary-password:latest
+  --set-env-vars=CANARY_RUNTIME=cloud-run,CANARY_ENVIRONMENT=staging,CANARY_REGION=us-central1,CANARY_TARGET=staging-us-central1,CANARY_METRICS_EXPORTER=otlp,CANARY_LOCK_BACKEND=gcs,LOCK_BUCKET=canary-locks,CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai,OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.staging.superserve.ai \
+  --set-secrets=CANARY_UI_EMAIL=ui-canary-email:latest,CANARY_UI_PASSWORD=ui-canary-password:latest,CANARY_UI_VERCEL_PROTECTION_BYPASS=ui-canary-vercel-bypass:latest
 ```
 
 ## Target Inventory

@@ -34,6 +34,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if !cfg.Headless {
 		t.Errorf("expected headless true by default")
 	}
+	if cfg.VercelProtectionBypass != "" {
+		t.Errorf("expected empty VercelProtectionBypass by default, got %q", cfg.VercelProtectionBypass)
+	}
 }
 
 func TestLoadConfigCustom(t *testing.T) {
@@ -42,6 +45,7 @@ func TestLoadConfigCustom(t *testing.T) {
 	t.Setenv("CANARY_UI_PASSWORD", "secret123")
 	t.Setenv("CANARY_UI_HEADLESS", "false")
 	t.Setenv("CANARY_UI_STEP_TIMEOUT", "20s")
+	t.Setenv("CANARY_UI_VERCEL_PROTECTION_BYPASS", "secret-bypass-token")
 
 	base := config.Config{}
 	cfg, err := LoadConfig(base)
@@ -60,6 +64,9 @@ func TestLoadConfigCustom(t *testing.T) {
 	}
 	if cfg.StepTimeout != 20*time.Second {
 		t.Errorf("expected 20s step timeout, got %v", cfg.StepTimeout)
+	}
+	if cfg.VercelProtectionBypass != "secret-bypass-token" {
+		t.Errorf("expected secret-bypass-token, got %q", cfg.VercelProtectionBypass)
 	}
 }
 
@@ -90,8 +97,8 @@ func TestLoadConfigValidation(t *testing.T) {
 
 	// Missing console URL
 	_, err := LoadConfig(base)
-	if err == nil {
-		t.Errorf("expected error when console URL is missing")
+	if err == nil || err.Error() != "console URL is required (set CANARY_UI_CONSOLE_URL)" {
+		t.Errorf("expected 'console URL is required (set CANARY_UI_CONSOLE_URL)', got %v", err)
 	}
 
 	// Missing password
@@ -108,5 +115,46 @@ func TestLoadConfigValidation(t *testing.T) {
 	_, err = LoadConfig(base)
 	if err == nil {
 		t.Errorf("expected error when email is missing")
+	}
+}
+
+func TestValidateConsoleURL(t *testing.T) {
+	base := config.Config{}
+	t.Setenv("CANARY_UI_EMAIL", "user@test.com")
+	t.Setenv("CANARY_UI_PASSWORD", "secret123")
+
+	validCases := []string{
+		"http://localhost:3000",
+		"https://console.staging.superserve.ai",
+		"https://console.superserve.ai/path",
+	}
+	for _, url := range validCases {
+		t.Setenv("CANARY_UI_CONSOLE_URL", url)
+		if _, err := LoadConfig(base); err != nil {
+			t.Errorf("expected %q to be valid, got %v", url, err)
+		}
+	}
+
+	invalidCases := []string{
+		"ftp://example.com",
+		"not-a-url",
+		"/just/a/path",
+		"://missing-scheme",
+		"http://",
+	}
+	for _, url := range invalidCases {
+		t.Setenv("CANARY_UI_CONSOLE_URL", url)
+		_, err := LoadConfig(base)
+		if err == nil || err.Error() != "CANARY_UI_CONSOLE_URL must be a valid HTTP or HTTPS URL" {
+			t.Errorf("expected invalid URL error for %q, got %v", url, err)
+		}
+	}
+
+	for _, url := range []string{"", "   "} {
+		t.Setenv("CANARY_UI_CONSOLE_URL", url)
+		_, err := LoadConfig(base)
+		if err == nil || err.Error() != "console URL is required (set CANARY_UI_CONSOLE_URL)" {
+			t.Errorf("expected required URL error for %q, got %v", url, err)
+		}
 	}
 }

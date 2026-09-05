@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,9 +37,21 @@ func TestExtractSandboxIDFromURL(t *testing.T) {
 	}
 }
 
-func setupMockConsoleServer() *httptest.Server {
-	mux := http.NewServeMux()
+type mockServerState struct {
+	sync.Mutex
+	receivedBypassHeader       string
+	receivedBypassCookieHeader string
+	deletedSandbox             bool
+	failTerminal               bool
+}
 
+func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
+	var state *mockServerState
+	if len(opts) > 0 {
+		state = opts[0]
+	}
+
+	mux := http.NewServeMux()
 	var stateStatus = "Active"
 
 	mux.HandleFunc("/auth/signin", func(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +89,13 @@ func setupMockConsoleServer() *httptest.Server {
 	})
 
 	mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("deleted") == "true" {
+			if state != nil {
+				state.Lock()
+				state.deletedSandbox = true
+				state.Unlock()
+			}
+		}
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
@@ -83,9 +104,18 @@ func setupMockConsoleServer() *httptest.Server {
   <h1>Sandboxes</h1>
   <button id="create-btn" onclick="document.getElementById('dialog').style.display='block'">Create sandbox</button>
 
-  <div id="dialog" style="display:none;">
+  <div id="dialog" role="dialog" style="display:none;">
     <input type="text" placeholder="my-sandbox" id="name-input" />
-    <button id="submit-create" onclick="window.location.href='/sandboxes/sb-mock-123/'">Create Sandbox</button>
+    <button id="submit-create" onclick="document.getElementById('dialog').style.display='none'; document.getElementById('connect-dialog').style.display='block';">Create Sandbox</button>
+  </div>
+
+  <div id="connect-dialog" role="dialog" style="display:none;">
+    <h3>Connect to Sandbox</h3>
+    <pre>const sandbox = await Sandbox.connect("sb-mock-123", {
+  apiKey: process.env.SUPERSERVE_API_KEY,
+});</pre>
+    <button onclick="window.location.href='/sandboxes/sb-mock-123/terminal/'">Open Terminal</button>
+    <button onclick="document.getElementById('connect-dialog').style.display='none'">Done</button>
   </div>
 </body>
 </html>`)
@@ -110,9 +140,9 @@ func setupMockConsoleServer() *httptest.Server {
     <div role="menuitem" onclick="document.getElementById('delete-dialog').style.display='block'">Delete sandbox</div>
   </div>
 
-  <div id="delete-dialog" style="display:none;">
+  <div id="delete-dialog" role="dialog" style="display:none;">
     <input placeholder="ui-canary-mock" id="delete-input" />
-    <button id="confirm-del" onclick="window.location.href='/sandboxes/'">Delete</button>
+    <button id="confirm-del" onclick="window.location.href='/sandboxes/?deleted=true'">Delete</button>
   </div>
 </body>
 </html>`, stateStatus)
@@ -120,10 +150,21 @@ func setupMockConsoleServer() *httptest.Server {
 
 	mux.HandleFunc("/sandboxes/sb-mock-123/terminal/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
+		shouldFail := false
+		if state != nil {
+			state.Lock()
+			shouldFail = state.failTerminal
+			state.Unlock()
+		}
+
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>Terminal</title></head>
 <body>
+  <div class="header">
+    <span id="status-badge">Active</span>
+    <a href="/sandboxes/sb-mock-123/">ui-canary-test</a>
+  </div>
   <div class="xterm" style="position:relative; width:100vw; height:100vh;" onclick="document.querySelector('.xterm-helper-textarea').focus()">
     <textarea class="xterm-helper-textarea" style="opacity:0; position:absolute; top:0; left:0;"></textarea>
     <div class="xterm-rows">
@@ -140,8 +181,14 @@ func setupMockConsoleServer() *httptest.Server {
         var lines = document.querySelector('.xterm-rows');
         var div = document.createElement('div');
         var val = ta.value;
-        if (val.indexOf('$((1234 + 5678))') !== -1) {
-          div.innerText = val.replace('$((1234 + 5678))', '6912');
+        var match = val.match(/\$\(\(\s*(\d+)\s*\+\s*(\d+)\s*\)\)/);
+        if (match) {
+          if (%t) {
+            div.innerText = 'terminal_error';
+          } else {
+            var sum = parseInt(match[1], 10) + parseInt(match[2], 10);
+            div.innerText = 'RES_UI_' + sum;
+          }
         } else {
           div.innerText = val;
         }
@@ -150,10 +197,24 @@ func setupMockConsoleServer() *httptest.Server {
     });
   </script>
 </body>
-</html>`)
+</html>`, shouldFail)
 	})
 
-	return httptest.NewServer(mux)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if state != nil {
+			state.Lock()
+			if v := r.Header.Get("x-vercel-protection-bypass"); v != "" {
+				state.receivedBypassHeader = v
+			}
+			if v := r.Header.Get("x-vercel-set-bypass-cookie"); v != "" {
+				state.receivedBypassCookieHeader = v
+			}
+			state.Unlock()
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	return httptest.NewServer(handler)
 }
 
 func skipIfPlaywrightUnavailable(t *testing.T) {
@@ -172,10 +233,29 @@ func skipIfPlaywrightUnavailable(t *testing.T) {
 	_ = browser.Close()
 }
 
+func newMockRunnerConfig(serverURL, bypassToken string) Config {
+	return Config{
+		BaseConfig: config.Config{
+			Environment: "staging",
+			Region:      "us-central1",
+			Target:      "staging-us-central1",
+			RunTimeout:  30 * time.Second,
+		},
+		ConsoleURL:             serverURL,
+		Email:                  "canary@superserve.ai",
+		Password:               "password123",
+		VercelProtectionBypass: bypassToken,
+		Headless:               true,
+		StepTimeout:            5 * time.Second,
+		TerminalTimeout:        5 * time.Second,
+	}
+}
+
 func TestUIRunnerWithMockServer(t *testing.T) {
 	skipIfPlaywrightUnavailable(t)
 
-	server := setupMockConsoleServer()
+	state := &mockServerState{}
+	server := setupMockConsoleServer(state)
 	defer server.Close()
 
 	artifactsDir, err := os.MkdirTemp("", "ui-canary-test-*")
@@ -184,23 +264,8 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 	}
 	defer os.RemoveAll(artifactsDir)
 
-	baseCfg := config.Config{
-		Environment: "staging",
-		Region:      "us-central1",
-		Target:      "staging-us-central1",
-		RunTimeout:  30 * time.Second,
-	}
-
-	cfg := Config{
-		BaseConfig:      baseCfg,
-		ConsoleURL:      server.URL,
-		Email:           "canary@superserve.ai",
-		Password:        "password123",
-		Headless:        true,
-		ArtifactsDir:    artifactsDir,
-		StepTimeout:     5 * time.Second,
-		TerminalTimeout: 5 * time.Second,
-	}
+	cfg := newMockRunnerConfig(server.URL, "test-bypass-secret-123")
+	cfg.ArtifactsDir = artifactsDir
 
 	var taggedSandboxID string
 	var taggedMetadata map[string]string
@@ -235,6 +300,18 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 	if taggedMetadata[sandboxmetadata.KeyManagedBy] != sandboxmetadata.ManagedByCanaryLegacy {
 		t.Errorf("expected managed_by %q, got %q", sandboxmetadata.ManagedByCanaryLegacy, taggedMetadata[sandboxmetadata.KeyManagedBy])
 	}
+
+	state.Lock()
+	defer state.Unlock()
+	if state.receivedBypassHeader != "test-bypass-secret-123" {
+		t.Errorf("expected bypass header 'test-bypass-secret-123', got %q", state.receivedBypassHeader)
+	}
+	if state.receivedBypassCookieHeader != "true" {
+		t.Errorf("expected bypass cookie header 'true', got %q", state.receivedBypassCookieHeader)
+	}
+	if !state.deletedSandbox {
+		t.Errorf("expected sandbox to be deleted in UI lifecycle")
+	}
 }
 
 type mockSandboxTagger struct {
@@ -248,28 +325,84 @@ func (m *mockSandboxTagger) TagSandbox(ctx context.Context, sandboxID string, me
 	return nil
 }
 
+func TestUIRunnerWithoutBypassHeaders(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "") // unconfigured bypass
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err != nil {
+		t.Fatalf("Runner failed: %v", err)
+	}
+
+	state.Lock()
+	defer state.Unlock()
+	if state.receivedBypassHeader != "" {
+		t.Errorf("expected no bypass header, got %q", state.receivedBypassHeader)
+	}
+	if state.receivedBypassCookieHeader != "" {
+		t.Errorf("expected no bypass cookie header, got %q", state.receivedBypassCookieHeader)
+	}
+}
+
+func TestDeferredCleanupOnPostCreateFailure(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{failTerminal: true}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 3 * time.Second
+	cfg.TerminalTimeout = 1 * time.Second
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail on terminal step")
+	}
+
+	state.Lock()
+	defer state.Unlock()
+	if !state.deletedSandbox {
+		t.Errorf("expected deferred cleanup to delete sandbox when terminal step failed")
+	}
+}
+
 func TestAuthenticateInvalidCredentials(t *testing.T) {
 	skipIfPlaywrightUnavailable(t)
 
 	server := setupMockConsoleServer()
 	defer server.Close()
 
-	baseCfg := config.Config{
-		Environment: "staging",
-		Region:      "us-central1",
-		Target:      "staging-us-central1",
-		RunTimeout:  30 * time.Second,
-	}
-
-	cfg := Config{
-		BaseConfig:      baseCfg,
-		ConsoleURL:      server.URL,
-		Email:           "", // invalid empty credentials
-		Password:        "",
-		Headless:        true,
-		StepTimeout:     3 * time.Second,
-		TerminalTimeout: 3 * time.Second,
-	}
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.Email = "" // invalid empty credentials
+	cfg.Password = ""
+	cfg.StepTimeout = 3 * time.Second
+	cfg.TerminalTimeout = 3 * time.Second
 
 	runner := Runner{
 		Config:  cfg,
@@ -284,5 +417,40 @@ func TestAuthenticateInvalidCredentials(t *testing.T) {
 	err := runner.Run(ctx)
 	if err == nil {
 		t.Fatal("expected runner to fail with invalid credentials")
+	}
+}
+
+func TestGenerateTerminalCommand(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		cmd, expected := generateTerminalCommand()
+
+		// Verify command structure: echo "RES_UI_$((nonceA + nonceB))"
+		if !strings.HasPrefix(cmd, `echo "RES_UI_$((`) || !strings.HasSuffix(cmd, `))"`) {
+			t.Fatalf("unexpected command format: %q", cmd)
+		}
+
+		// Verify expected output format: RES_UI_<sum>
+		if !strings.HasPrefix(expected, "RES_UI_") {
+			t.Fatalf("unexpected expectedOutput format: %q", expected)
+		}
+
+		// Extract nonces
+		var a, b int
+		n, err := fmt.Sscanf(cmd, `echo "RES_UI_$((%d + %d))"`, &a, &b)
+		if err != nil || n != 2 {
+			t.Fatalf("failed to parse nonces from command %q: %v", cmd, err)
+		}
+
+		if a < 1000 || a >= 10000 || b < 1000 || b >= 10000 {
+			t.Errorf("nonces out of range [1000, 9999]: a=%d, b=%d", a, b)
+		}
+		if a == b {
+			t.Errorf("expected distinct nonces, got a=%d == b=%d", a, b)
+		}
+
+		wantExpected := fmt.Sprintf("RES_UI_%d", a+b)
+		if expected != wantExpected {
+			t.Errorf("expectedOutput = %q, want %q", expected, wantExpected)
+		}
 	}
 }

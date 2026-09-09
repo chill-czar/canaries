@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -305,7 +306,7 @@ func TestLoadTargetValidation(t *testing.T) {
 	})
 }
 
-func TestUILifecycleCloudRunLocking(t *testing.T) {
+func TestUILifecycleCloudRunLockingAndTagging(t *testing.T) {
 	base := func() {
 		t.Setenv("CANARY_TARGET", "staging-us-central1")
 		t.Setenv("CANARY_ENVIRONMENT", "staging")
@@ -314,6 +315,8 @@ func TestUILifecycleCloudRunLocking(t *testing.T) {
 		t.Setenv("CANARY_RUNTIME", "cloud-run")
 		t.Setenv("CANARY_METRICS_EXPORTER", "otlp")
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "https://collector.example/v1/metrics")
+		t.Setenv("CANARY_API_KEY", "test-api-key")
+		t.Setenv("API_BASE_URL", "https://api-staging.superserve.ai")
 	}
 
 	t.Run("ui-lifecycle on cloud-run with lock=none rejected", func(t *testing.T) {
@@ -324,10 +327,41 @@ func TestUILifecycleCloudRunLocking(t *testing.T) {
 		}
 	})
 
-	t.Run("ui-lifecycle on cloud-run with gcs lock and bucket accepted", func(t *testing.T) {
+	t.Run("ui-lifecycle on cloud-run missing CANARY_API_KEY rejected", func(t *testing.T) {
 		base()
 		t.Setenv("CANARY_LOCK_BACKEND", "gcs")
 		t.Setenv("LOCK_BUCKET", "canary-locks")
+		t.Setenv("CANARY_API_KEY", "")
+		if _, err := Load("ui-lifecycle"); err == nil || !strings.Contains(err.Error(), "requires CANARY_API_KEY") {
+			t.Fatalf("expected error requiring CANARY_API_KEY, got %v", err)
+		}
+	})
+
+	t.Run("ui-lifecycle on cloud-run missing API_BASE_URL rejected", func(t *testing.T) {
+		base()
+		t.Setenv("CANARY_LOCK_BACKEND", "gcs")
+		t.Setenv("LOCK_BUCKET", "canary-locks")
+		t.Setenv("API_BASE_URL", "")
+		if _, err := Load("ui-lifecycle"); err == nil || !strings.Contains(err.Error(), "requires API_BASE_URL") {
+			t.Fatalf("expected error requiring API_BASE_URL, got %v", err)
+		}
+	})
+
+	t.Run("ui-lifecycle on cloud-run with gcs lock, bucket, and api credentials accepted", func(t *testing.T) {
+		base()
+		t.Setenv("CANARY_LOCK_BACKEND", "gcs")
+		t.Setenv("LOCK_BUCKET", "canary-locks")
+		if _, err := Load("ui-lifecycle"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ui-lifecycle on local runtime allows missing API credentials", func(t *testing.T) {
+		t.Setenv("CANARY_RUNTIME", "local")
+		t.Setenv("CANARY_API_KEY", "")
+		t.Setenv("API_BASE_URL", "")
+		t.Setenv("CANARY_METRICS_EXPORTER", "none")
+		t.Setenv("CANARY_LOCK_BACKEND", "none")
 		if _, err := Load("ui-lifecycle"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

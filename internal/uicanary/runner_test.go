@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,10 @@ type mockServerState struct {
 	receivedBypassCookieHeader string
 	deletedSandbox             bool
 	failTerminal               bool
+	externalURL                string
+	externalReceivedBypass     string
+	externalReceivedCookie     string
+	externalHitCount           int
 }
 
 func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
@@ -74,18 +79,27 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
+		externalHTML := ""
+		if state != nil {
+			state.Lock()
+			if state.externalURL != "" {
+				externalHTML = fmt.Sprintf(`<img src="%s/external-beacon" />`, state.externalURL)
+			}
+			state.Unlock()
+		}
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>Sign In</title></head>
 <body>
   <h1>Sign In</h1>
+  %s
   <form method="POST" action="/auth/signin">
     <input type="email" placeholder="Email" name="email" value="" />
     <input type="password" placeholder="Password" name="password" value="" />
     <button type="submit">Sign In</button>
   </form>
 </body>
-</html>`)
+</html>`, externalHTML)
 	})
 
 	mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +272,20 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 	server := setupMockConsoleServer(state)
 	defer server.Close()
 
+	externalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.Lock()
+		state.externalHitCount++
+		state.externalReceivedBypass = r.Header.Get("x-vercel-protection-bypass")
+		state.externalReceivedCookie = r.Header.Get("x-vercel-set-bypass-cookie")
+		state.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer externalServer.Close()
+
+	state.Lock()
+	state.externalURL = externalServer.URL
+	state.Unlock()
+
 	artifactsDir, err := os.MkdirTemp("", "ui-canary-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -311,6 +339,15 @@ func TestUIRunnerWithMockServer(t *testing.T) {
 	}
 	if !state.deletedSandbox {
 		t.Errorf("expected sandbox to be deleted in UI lifecycle")
+	}
+	if state.externalHitCount == 0 {
+		t.Errorf("expected external server to be requested by browser")
+	}
+	if state.externalReceivedBypass != "" {
+		t.Errorf("expected cross-origin request to have NO bypass header, got %q", state.externalReceivedBypass)
+	}
+	if state.externalReceivedCookie != "" {
+		t.Errorf("expected cross-origin request to have NO bypass cookie header, got %q", state.externalReceivedCookie)
 	}
 }
 
@@ -452,5 +489,45 @@ func TestGenerateTerminalCommand(t *testing.T) {
 		if expected != wantExpected {
 			t.Errorf("expectedOutput = %q, want %q", expected, wantExpected)
 		}
+	}
+}
+
+func TestConcurrentIDDiscoveryRace(t *testing.T) {
+	const goroutines = 50
+	var discoveredCount int32
+	var firstDiscoveredID string
+	var mu sync.Mutex
+
+	tracker := newSandboxIDTracker(func(id string) {
+		atomic.AddInt32(&discoveredCount, 1)
+		mu.Lock()
+		firstDiscoveredID = id
+		mu.Unlock()
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			idCandidate := fmt.Sprintf("sb-test-%d", idx%5)
+			// Concurrently set and read
+			_ = tracker.Set(idCandidate)
+			_ = tracker.Get()
+		}(i)
+	}
+	wg.Wait()
+
+	finalID := tracker.Get()
+	if finalID == "" {
+		t.Fatal("expected non-empty final ID")
+	}
+	if count := atomic.LoadInt32(&discoveredCount); count != 1 {
+		t.Fatalf("expected onDiscovered callback to fire exactly once, fired %d times", count)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if firstDiscoveredID != finalID {
+		t.Fatalf("expected discovered ID %q to match final ID %q", firstDiscoveredID, finalID)
 	}
 }

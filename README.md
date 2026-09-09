@@ -58,7 +58,7 @@ Per run it:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `CANARY_UI_CONSOLE_URL` | **Yes** | — | Target Superserve Console URL (e.g. `https://console.staging.superserve.ai` or `http://localhost:3000`) |
+| `CANARY_UI_CONSOLE_URL` | **Yes** | — | Target Superserve Console URL (e.g. `https://console-staging.superserve.ai` or `http://localhost:3000`) |
 | `CANARY_UI_EMAIL` | **Yes** | — | Canary operator login email |
 | `CANARY_UI_PASSWORD` | **Yes** | — | Canary operator login password |
 | `CANARY_UI_VERCEL_PROTECTION_BYPASS` | No | — | Vercel deployment protection bypass secret (injected via `x-vercel-protection-bypass` and `x-vercel-set-bypass-cookie: true` headers; never embed in `CANARY_UI_CONSOLE_URL`) |
@@ -72,7 +72,8 @@ Per run it:
 Run with `make run-ui` (reads credentials and console URL from `.env` or environment):
 
 ```bash
-export CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai
+export CANARY_UI_CONSOLE_URL=https://console-staging.superserve.ai
+export CANARY_UI_VERCEL_PROTECTION_BYPASS=secret123 # required for protected staging
 export CANARY_UI_EMAIL=canary@superserve.ai
 export CANARY_UI_PASSWORD=secret123
 
@@ -90,22 +91,25 @@ docker run --rm \
   -e CANARY_TARGET=staging-us-central1 \
   -e CANARY_ENVIRONMENT=staging \
   -e CANARY_REGION=us-central1 \
-  -e CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai \
+  -e CANARY_UI_CONSOLE_URL=https://console-staging.superserve.ai \
+  -e CANARY_UI_VERCEL_PROTECTION_BYPASS=secret123 \
   -e CANARY_UI_EMAIL=canary@superserve.ai \
   -e CANARY_UI_PASSWORD=secret123 \
   superserve/ui-canary:latest
 ```
 
-### Cloud Run Deployment
+### Cloud Run Deployment & Terraform Infrastructure
 
-On Cloud Run (`CANARY_RUNTIME=cloud-run`), the UI canary requires OTLP telemetry and GCS target locking:
+The UI canary is defined declaratively in Terraform under `infra/modules/ui_canary` and instantiated per environment (e.g. `infra/envs/staging/us-central1/main.tf`). It provisions:
+- A Cloud Run v2 Job configured with the Playwright runtime container, GCS target locking, and OTLP metrics.
+- A Cloud Scheduler job running on a 5-minute cron schedule (`*/5 * * * *`).
+- Secret Manager bindings for operator credentials, Vercel bypass (staging), and the Canary API key for durable ownership metadata tagging.
+
+Deployments are applied via Terraform:
 
 ```bash
-gcloud run jobs create ui-canary-staging-us-central1 \
-  --image=superserve/ui-canary:latest \
-  --region=us-central1 \
-  --set-env-vars=CANARY_RUNTIME=cloud-run,CANARY_ENVIRONMENT=staging,CANARY_REGION=us-central1,CANARY_TARGET=staging-us-central1,CANARY_METRICS_EXPORTER=otlp,CANARY_LOCK_BACKEND=gcs,LOCK_BUCKET=canary-locks,CANARY_UI_CONSOLE_URL=https://console.staging.superserve.ai,OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.staging.superserve.ai \
-  --set-secrets=CANARY_UI_EMAIL=ui-canary-email:latest,CANARY_UI_PASSWORD=ui-canary-password:latest,CANARY_UI_VERCEL_PROTECTION_BYPASS=ui-canary-vercel-bypass:latest
+cd infra/envs/staging/us-central1
+terraform apply
 ```
 
 ## Target Inventory

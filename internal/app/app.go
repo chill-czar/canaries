@@ -28,6 +28,7 @@ func Run(ctx context.Context, args []string) (err error) {
 
 	cfg, err := config.Load(*mode)
 	if err != nil {
+		log.Error().Err(err).Str("mode", *mode).Msg("failed to load canary configuration")
 		return err
 	}
 

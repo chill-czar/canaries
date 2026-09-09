@@ -133,7 +133,7 @@ func Load(rawMode string) (Config, error) {
 		target = envDefault("CANARY_TARGET", "staging-us-central1")
 		environment = envDefault("CANARY_ENVIRONMENT", "staging")
 		region = envDefault("CANARY_REGION", "us-central1")
-		projectID = envDefault("GCP_PROJECT_ID", "superserve")
+		projectID = envDefault("GCP_PROJECT_ID", "rayai-dev")
 	}
 
 	cfg := Config{
@@ -238,6 +238,14 @@ func Load(rawMode string) (Config, error) {
 		}
 		if cfg.LockBucket == "" {
 			return Config{}, fmt.Errorf("CANARY_RUNTIME=cloud-run requires LOCK_BUCKET")
+		}
+		if cfg.Mode == ModeUILifecycle {
+			if strings.TrimSpace(cfg.APIKey) == "" {
+				return Config{}, errors.New("CANARY_RUNTIME=cloud-run in ui-lifecycle mode requires CANARY_API_KEY for durable ownership tagging")
+			}
+			if strings.TrimSpace(cfg.APIBaseURL) == "" {
+				return Config{}, errors.New("CANARY_RUNTIME=cloud-run in ui-lifecycle mode requires API_BASE_URL for durable ownership tagging")
+			}
 		}
 	case RuntimeLocal:
 	}
@@ -396,7 +404,6 @@ func loadDotEnv() {
 
 // validateTargetTuple checks that target is a two-part hyphen-separated string
 // whose first part equals environment and second part equals region.
-// This is only enforced for ModeUILifecycle to catch misconfigured deployments early.
 func validateTargetTuple(target, environment, region string) error {
 	parts := strings.SplitN(target, "-", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 	"github.com/playwright-community/playwright-go"
 	"github.com/rs/zerolog/log"
 
+	"github.com/superserve-ai/canaries/internal/config"
 	"github.com/superserve-ai/canaries/internal/lock"
 	"github.com/superserve-ai/canaries/internal/metrics"
 	"github.com/superserve-ai/canaries/internal/sandboxmetadata"
@@ -43,6 +45,39 @@ type RunResult struct {
 	SandboxID  string
 }
 
+type sandboxIDTracker struct {
+	mu           sync.Mutex
+	id           string
+	onDiscovered func(string)
+}
+
+func newSandboxIDTracker(onDiscovered func(string)) *sandboxIDTracker {
+	return &sandboxIDTracker{onDiscovered: onDiscovered}
+}
+
+func (t *sandboxIDTracker) Set(id string) bool {
+	cleanID := strings.TrimSpace(id)
+	if cleanID == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.id == "" {
+		t.id = cleanID
+		if t.onDiscovered != nil {
+			t.onDiscovered(cleanID)
+		}
+		return true
+	}
+	return false
+}
+
+func (t *sandboxIDTracker) Get() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.id
+}
+
 func (r Runner) now() time.Time {
 	if r.Clock != nil {
 		return r.Clock()
@@ -65,19 +100,7 @@ func (r Runner) Run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
 
-	target := r.Config.BaseConfig.Target
-	if target == "" {
-		target = "staging-us-central1"
-	}
-	env := r.Config.BaseConfig.Environment
-	region := r.Config.BaseConfig.Region
-	if env == "" || region == "" {
-		parts := strings.Split(target, "-")
-		if len(parts) >= 2 {
-			env = parts[0]
-			region = strings.Join(parts[1:], "-")
-		}
-	}
+	target, env, region := resolveTargetTuple(r.Config.BaseConfig)
 
 	lockTTL := r.Config.BaseConfig.LockTTL
 	if lockTTL <= 0 {
@@ -146,21 +169,30 @@ func (r Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) {
-	mp := r.metricsProvider()
-	target := r.Config.BaseConfig.Target
+func resolveTargetTuple(baseCfg config.Config) (target, env, region string) {
+	target = baseCfg.Target
 	if target == "" {
 		target = "staging-us-central1"
 	}
-	env := r.Config.BaseConfig.Environment
-	region := r.Config.BaseConfig.Region
-	if env == "" && target != "" {
+	env = baseCfg.Environment
+	region = baseCfg.Region
+	if (env == "" || region == "") && target != "" {
 		parts := strings.Split(target, "-")
 		if len(parts) >= 2 {
-			env = parts[0]
-			region = strings.Join(parts[1:], "-")
+			if env == "" {
+				env = parts[0]
+			}
+			if region == "" {
+				region = strings.Join(parts[1:], "-")
+			}
 		}
 	}
+	return target, env, region
+}
+
+func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) {
+	mp := r.metricsProvider()
+	target, env, region := resolveTargetTuple(r.Config.BaseConfig)
 	scenario := "ui-lifecycle"
 
 	_ = playwright.Install(&playwright.RunOptions{
@@ -191,12 +223,6 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	contextOpts := playwright.BrowserNewContextOptions{
 		Viewport: &playwright.Size{Width: 1280, Height: 800},
 	}
-	if r.Config.VercelProtectionBypass != "" {
-		contextOpts.ExtraHttpHeaders = map[string]string{
-			"x-vercel-protection-bypass": r.Config.VercelProtectionBypass,
-			"x-vercel-set-bypass-cookie": "true",
-		}
-	}
 
 	bCtx, err := browser.NewContext(contextOpts)
 	if err != nil {
@@ -205,6 +231,31 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		return res
 	}
 	defer bCtx.Close()
+
+	if r.Config.VercelProtectionBypass != "" {
+		consoleParsed, pErr := url.Parse(r.Config.ConsoleURL)
+		if pErr == nil {
+			err = bCtx.Route("**/*", func(route playwright.Route) {
+				req := route.Request()
+				reqURL, err := url.Parse(req.URL())
+				if err == nil && reqURL.Scheme == consoleParsed.Scheme && reqURL.Host == consoleParsed.Host {
+					headers := req.Headers()
+					headers["x-vercel-protection-bypass"] = r.Config.VercelProtectionBypass
+					headers["x-vercel-set-bypass-cookie"] = "true"
+					_ = route.Continue(playwright.RouteContinueOptions{
+						Headers: headers,
+					})
+					return
+				}
+				_ = route.Continue()
+			})
+			if err != nil {
+				res.Err = fmt.Errorf("configure vercel bypass route: %w", err)
+				res.FailedStep = "browser_context"
+				return res
+			}
+		}
+	}
 
 	page, err := bCtx.NewPage()
 	if err != nil {
@@ -232,16 +283,40 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	stepTimeoutMs := float64(stepTimeout.Milliseconds())
 
 	var (
+		cleanupMu          sync.Mutex
 		createdSandboxID   string
 		createdSandboxName string
 		sandboxDeleted     bool
 	)
+	setCreatedID := func(id string) {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		if createdSandboxID == "" && id != "" {
+			createdSandboxID = id
+		}
+	}
+	getCreatedID := func() string {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		return createdSandboxID
+	}
+	markDeleted := func() {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		sandboxDeleted = true
+	}
 
 	// Guaranteed deferred cleanup if sandbox was created but not successfully deleted
 	defer func() {
-		if createdSandboxID != "" && !sandboxDeleted {
-			log.Info().Str("sandbox_id", createdSandboxID).Str("sandbox_name", createdSandboxName).Msg("executing deferred sandbox cleanup on failure/exit")
-			_ = r.deleteSandboxInUI(page, createdSandboxID, createdSandboxName, stepTimeoutMs)
+		cleanupMu.Lock()
+		idToClean := createdSandboxID
+		nameToClean := createdSandboxName
+		isDel := sandboxDeleted
+		cleanupMu.Unlock()
+
+		if idToClean != "" && !isDel {
+			log.Info().Str("sandbox_id", idToClean).Str("sandbox_name", nameToClean).Msg("executing deferred sandbox cleanup on failure/exit")
+			_ = r.deleteSandboxInUI(page, idToClean, nameToClean, stepTimeoutMs)
 		}
 	}()
 
@@ -261,11 +336,20 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	createStart := r.now()
 	log.Info().Msg("UI step: create_sandbox")
 	sandboxName := fmt.Sprintf("ui-canary-%d", r.now().Unix())
+	cleanupMu.Lock()
 	createdSandboxName = sandboxName
+	cleanupMu.Unlock()
+
 	sbID, err := r.createSandboxInUI(page, sandboxName, stepTimeoutMs, func(id string) {
-		createdSandboxID = id
-		res.SandboxID = id
+		setCreatedID(id)
 	})
+	activeID := getCreatedID()
+	if sbID != "" && activeID == "" {
+		setCreatedID(sbID)
+		activeID = sbID
+	}
+	res.SandboxID = activeID
+
 	if err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "failure", r.now().Sub(createStart))
 		captureArtifacts("create_sandbox")
@@ -273,22 +357,20 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		res.FailedStep = "create_sandbox"
 		return res
 	}
-	createdSandboxID = sbID
-	res.SandboxID = createdSandboxID
 
 	// Tag the sandbox with ownership metadata so the janitor can reap it if this
 	// run crashes before the delete step. Best-effort: a tagging failure is logged
 	// but does not fail the canary run.
-	if r.Tagger != nil {
+	if r.Tagger != nil && activeID != "" {
 		tagMeta := sandboxmetadata.LegacyCanaryMetadata(
 			env, region, target, runID,
 			r.now(),
 			r.now().Add(r.Config.BaseConfig.RetainFailedSandboxTTL),
 		)
-		if tagErr := r.Tagger.TagSandbox(ctx, createdSandboxID, tagMeta); tagErr != nil {
-			log.Warn().Err(tagErr).Str("sandbox_id", createdSandboxID).Msg("failed to tag sandbox metadata; janitor cannot reap it if run fails")
+		if tagErr := r.Tagger.TagSandbox(ctx, activeID, tagMeta); tagErr != nil {
+			log.Warn().Err(tagErr).Str("sandbox_id", activeID).Msg("failed to tag sandbox metadata; janitor cannot reap it if run fails")
 		} else {
-			log.Debug().Str("sandbox_id", createdSandboxID).Msg("sandbox tagged with canary ownership metadata")
+			log.Debug().Str("sandbox_id", activeID).Msg("sandbox tagged with canary ownership metadata")
 		}
 	}
 
@@ -297,7 +379,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 3: Interactive Terminal Execution
 	termStart := r.now()
 	log.Info().Msg("UI step: terminal_exec")
-	if err := r.executeTerminalCommand(page, res.SandboxID, r.Config.TerminalTimeout); err != nil {
+	if err := r.executeTerminalCommand(page, activeID, r.Config.TerminalTimeout); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "terminal_exec", "failure", r.now().Sub(termStart))
 		captureArtifacts("terminal_exec")
 		res.Err = fmt.Errorf("terminal execution: %w", err)
@@ -309,7 +391,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 4: Pause Sandbox
 	pauseStart := r.now()
 	log.Info().Msg("UI step: pause_sandbox")
-	if err := r.pauseSandboxInUI(page, res.SandboxID, stepTimeoutMs); err != nil {
+	if err := r.pauseSandboxInUI(page, activeID, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "pause_sandbox", "failure", r.now().Sub(pauseStart))
 		captureArtifacts("pause_sandbox")
 		res.Err = fmt.Errorf("pause sandbox: %w", err)
@@ -321,7 +403,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 5: Resume Sandbox
 	resumeStart := r.now()
 	log.Info().Msg("UI step: resume_sandbox")
-	if err := r.resumeSandboxInUI(page, res.SandboxID, stepTimeoutMs); err != nil {
+	if err := r.resumeSandboxInUI(page, activeID, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "resume_sandbox", "failure", r.now().Sub(resumeStart))
 		captureArtifacts("resume_sandbox")
 		res.Err = fmt.Errorf("resume sandbox: %w", err)
@@ -333,14 +415,14 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 6: Delete Sandbox
 	deleteStart := r.now()
 	log.Info().Msg("UI step: delete_sandbox")
-	if err := r.deleteSandboxInUI(page, res.SandboxID, sandboxName, stepTimeoutMs); err != nil {
+	if err := r.deleteSandboxInUI(page, activeID, sandboxName, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "delete_sandbox", "failure", r.now().Sub(deleteStart))
 		captureArtifacts("delete_sandbox")
 		res.Err = fmt.Errorf("delete sandbox: %w", err)
 		res.FailedStep = "delete_sandbox"
 		return res
 	}
-	sandboxDeleted = true
+	markDeleted()
 	mp.RecordStep(ctx, env, region, target, scenario, "delete_sandbox", "success", r.now().Sub(deleteStart))
 
 	return res
@@ -407,21 +489,12 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	var (
-		sandboxID string
-		idMu      sync.Mutex
-	)
-	setID := func(id string) {
-		idMu.Lock()
-		defer idMu.Unlock()
-		if sandboxID == "" && id != "" {
-			sandboxID = id
-			log.Info().Str("sandbox_id", sandboxID).Msg("discovered created sandbox ID")
-			if onIDDiscovered != nil {
-				onIDDiscovered(id)
-			}
+	tracker := newSandboxIDTracker(func(id string) {
+		log.Info().Str("sandbox_id", id).Msg("discovered created sandbox ID")
+		if onIDDiscovered != nil {
+			onIDDiscovered(id)
 		}
-	}
+	})
 
 	// Intercept backend creation response to grab ID immediately on wire asynchronously.
 	// NOTE: Must run inside a goroutine to avoid deadlocking the Playwright message reader.
@@ -435,7 +508,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 						ID string `json:"id"`
 					}
 					if err := json.Unmarshal(body, &data); err == nil && data.ID != "" {
-						setID(data.ID)
+						tracker.Set(data.ID)
 					}
 				}
 			}
@@ -461,15 +534,18 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		if count, _ := openTerminalBtn.Count(); count > 0 {
 			if visible, _ := openTerminalBtn.IsVisible(); visible {
 				if id := extractSandboxIDFromDialog(page); id != "" {
-					setID(id)
+					tracker.Set(id)
 				}
 				_ = openTerminalBtn.Click()
-				log.Info().Str("sandbox_id", sandboxID).Msg("clicked Open Terminal; waiting for navigation to terminal")
-				_ = page.WaitForURL(fmt.Sprintf("%s/sandboxes/%s/**", r.Config.ConsoleURL, sandboxID), playwright.PageWaitForURLOptions{
-					Timeout: playwright.Float(5000),
-				})
+				currentID := tracker.Get()
+				log.Info().Str("sandbox_id", currentID).Msg("clicked Open Terminal; waiting for navigation to terminal")
+				if currentID != "" {
+					_ = page.WaitForURL(fmt.Sprintf("%s/sandboxes/%s/**", r.Config.ConsoleURL, currentID), playwright.PageWaitForURLOptions{
+						Timeout: playwright.Float(5000),
+					})
+				}
 				if id := extractSandboxIDFromURL(page.URL()); id != "" {
-					setID(id)
+					tracker.Set(id)
 					break
 				}
 			}
@@ -477,7 +553,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 
 		// 2. Check if URL already contains sandbox ID
 		if id := extractSandboxIDFromURL(page.URL()); id != "" {
-			setID(id)
+			tracker.Set(id)
 			break
 		}
 
@@ -485,7 +561,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		if count, _ := doneBtn.Count(); count > 0 {
 			if visible, _ := doneBtn.IsVisible(); visible {
 				if id := extractSandboxIDFromDialog(page); id != "" {
-					setID(id)
+					tracker.Set(id)
 				}
 				_ = doneBtn.Click()
 			}
@@ -497,12 +573,12 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			_ = row.Click()
 			time.Sleep(500 * time.Millisecond)
 			if id := extractSandboxIDFromURL(page.URL()); id != "" {
-				setID(id)
+				tracker.Set(id)
 				break
 			}
 		}
 
-		if sandboxID != "" {
+		if tracker.Get() != "" {
 			break
 		}
 
@@ -510,7 +586,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 	}
 
 	// 5. Fallback: navigate directly to sandboxes list and find row
-	if sandboxID == "" {
+	if tracker.Get() == "" {
 		listURL := fmt.Sprintf("%s/sandboxes/", r.Config.ConsoleURL)
 		_, _ = page.Goto(listURL, playwright.PageGotoOptions{
 			Timeout:   playwright.Float(timeoutMs),
@@ -522,43 +598,44 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			_ = row.Click()
 			time.Sleep(500 * time.Millisecond)
 			if id := extractSandboxIDFromURL(page.URL()); id != "" {
-				setID(id)
+				tracker.Set(id)
 			}
 		}
 	}
 
-	if sandboxID == "" {
+	finalID := tracker.Get()
+	if finalID == "" {
 		return "", fmt.Errorf("could not extract sandbox ID after creation")
 	}
 
 	// Navigate to sandbox detail page if not already on a sandbox page
-	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, sandboxID)) {
-		detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, sandboxID)
+	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, finalID)) {
+		detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, finalID)
 		if _, err := page.Goto(detailURL, playwright.PageGotoOptions{
 			Timeout:   playwright.Float(timeoutMs),
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		}); err != nil {
-			return sandboxID, fmt.Errorf("navigate to detail page %s: %w", detailURL, err)
+			return finalID, fmt.Errorf("navigate to detail page %s: %w", detailURL, err)
 		}
 	}
 
 	// Wait for "Active" status indicator in SandboxStatusHero or Terminal header,
 	// periodically dispatching window focus event to prompt React Query to refetch
-	log.Info().Str("sandbox_id", sandboxID).Msg("waiting for sandbox to become active")
+	log.Info().Str("sandbox_id", finalID).Msg("waiting for sandbox to become active")
 	activeDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(activeDeadline) {
 		activeBadge := page.Locator("section:has-text('Active'), span:has-text('Active'), td:has-text('Active'), div:has-text('Active')").First()
 		if count, _ := activeBadge.Count(); count > 0 {
 			if visible, _ := activeBadge.IsVisible(); visible {
-				log.Info().Str("sandbox_id", sandboxID).Msg("sandbox is Active")
-				return sandboxID, nil
+				log.Info().Str("sandbox_id", finalID).Msg("sandbox is Active")
+				return finalID, nil
 			}
 		}
 		time.Sleep(1 * time.Second)
 		_, _ = page.Evaluate("() => window.dispatchEvent(new Event('focus'))")
 	}
 
-	return sandboxID, fmt.Errorf("waiting for sandbox %s to become active timed out", sandboxID)
+	return finalID, fmt.Errorf("waiting for sandbox %s to become active timed out", finalID)
 }
 
 func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, timeout time.Duration) error {

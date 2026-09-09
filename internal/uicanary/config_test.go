@@ -1,6 +1,7 @@
 package uicanary
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -8,7 +9,7 @@ import (
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
-	t.Setenv("CANARY_UI_CONSOLE_URL", "https://console.staging.superserve.ai")
+	t.Setenv("CANARY_UI_CONSOLE_URL", "https://console-staging.superserve.ai")
 	t.Setenv("CANARY_UI_EMAIL", "test@superserve.ai")
 	t.Setenv("CANARY_UI_PASSWORD", "secret123")
 	t.Setenv("CANARY_UI_HEADLESS", "")
@@ -25,8 +26,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.ConsoleURL != "https://console.staging.superserve.ai" {
-		t.Errorf("expected console url https://console.staging.superserve.ai, got %s", cfg.ConsoleURL)
+	if cfg.ConsoleURL != "https://console-staging.superserve.ai" {
+		t.Errorf("expected console url https://console-staging.superserve.ai, got %s", cfg.ConsoleURL)
 	}
 	if cfg.Email != "test@superserve.ai" || cfg.Password != "secret123" {
 		t.Errorf("unexpected credentials: %s / %s", cfg.Email, cfg.Password)
@@ -125,7 +126,7 @@ func TestValidateConsoleURL(t *testing.T) {
 
 	validCases := []string{
 		"http://localhost:3000",
-		"https://console.staging.superserve.ai",
+		"https://console-staging.superserve.ai",
 		"https://console.superserve.ai/path",
 	}
 	for _, url := range validCases {
@@ -156,5 +157,43 @@ func TestValidateConsoleURL(t *testing.T) {
 		if err == nil || err.Error() != "console URL is required (set CANARY_UI_CONSOLE_URL)" {
 			t.Errorf("expected required URL error for %q, got %v", url, err)
 		}
+	}
+}
+
+func TestLoadConfigCloudRunTaggingCredentials(t *testing.T) {
+	t.Setenv("CANARY_UI_CONSOLE_URL", "https://console-staging.superserve.ai")
+	t.Setenv("CANARY_UI_EMAIL", "test@superserve.ai")
+	t.Setenv("CANARY_UI_PASSWORD", "secret123")
+
+	// Missing both
+	cloudRunBase := config.Config{Runtime: config.RuntimeCloudRun}
+	_, err := LoadConfig(cloudRunBase)
+	if err == nil || !strings.Contains(err.Error(), "requires CANARY_API_KEY and API_BASE_URL") {
+		t.Fatalf("expected error requiring API key and base URL, got: %v", err)
+	}
+
+	// Missing API Key
+	cloudRunBase.APIBaseURL = "https://api-staging.superserve.ai"
+	_, err = LoadConfig(cloudRunBase)
+	if err == nil || !strings.Contains(err.Error(), "requires CANARY_API_KEY and API_BASE_URL") {
+		t.Fatalf("expected error requiring API key, got: %v", err)
+	}
+
+	// Missing API Base URL
+	cloudRunBase.APIBaseURL = ""
+	cloudRunBase.APIKey = "key_123"
+	_, err = LoadConfig(cloudRunBase)
+	if err == nil || !strings.Contains(err.Error(), "requires CANARY_API_KEY and API_BASE_URL") {
+		t.Fatalf("expected error requiring API base URL, got: %v", err)
+	}
+
+	// Both present
+	cloudRunBase.APIBaseURL = "https://api-staging.superserve.ai"
+	cfg, err := LoadConfig(cloudRunBase)
+	if err != nil {
+		t.Fatalf("unexpected error with valid cloud run config: %v", err)
+	}
+	if cfg.BaseConfig.APIKey != "key_123" {
+		t.Errorf("expected APIKey key_123, got: %s", cfg.BaseConfig.APIKey)
 	}
 }

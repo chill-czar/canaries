@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/canaries/internal/config"
 )
 
@@ -24,6 +25,14 @@ type Config struct {
 }
 
 func LoadConfig(baseCfg config.Config) (Config, error) {
+	if baseCfg.Runtime == config.RuntimeCloudRun {
+		if strings.TrimSpace(baseCfg.APIKey) == "" || strings.TrimSpace(baseCfg.APIBaseURL) == "" {
+			err := errors.New("CANARY_RUNTIME=cloud-run requires CANARY_API_KEY and API_BASE_URL for sandbox ownership tagging")
+			log.Error().Err(err).Msg("invalid cloud-run ui canary configuration")
+			return Config{}, err
+		}
+	}
+
 	consoleURL := strings.TrimRight(envDefault("CANARY_UI_CONSOLE_URL", os.Getenv("CANARY_UI_URL")), "/")
 	if consoleURL == "" {
 		return Config{}, errors.New("console URL is required (set CANARY_UI_CONSOLE_URL)")

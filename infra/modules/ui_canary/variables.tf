@@ -83,7 +83,7 @@ variable "scheduler_cron" {
 
 variable "scheduler_enabled" {
   type        = bool
-  default     = true
+  default     = false
   description = "Whether the Cloud Scheduler job is enabled"
 }
 

@@ -87,7 +87,8 @@ module "ui_canary" {
   environment                  = "staging"
   target_region                = "us-central1"
   console_url                  = "https://console-staging.superserve.ai"
-  image                        = var.image
+  image                        = coalesce(var.ui_canary_image, var.image)
+  scheduler_enabled            = var.ui_scheduler_enabled
   ui_email_secret_name         = "ui-canary-email-staging-us-central1"
   ui_password_secret_name      = "ui-canary-password-staging-us-central1"
   ui_vercel_bypass_secret_name = "ui-canary-vercel-bypass-staging-us-central1"

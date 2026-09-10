@@ -48,7 +48,7 @@ The UI canary runs automated end-to-end browser journeys against the Superserve 
 ### UI Lifecycle Scenario
 Per run it:
 1. **Authenticates**: Submits operator email and password on `/auth/signin`, verifies session cookie creation and navigates to `/sandboxes/`.
-2. **Creates Sandbox**: Opens create dialog with a timestamped sandbox name (`ui-canary-<unix>`) and asserts the **Active** status badge.
+2. **Creates Sandbox**: Opens create dialog with a timestamped sandbox name (`ui-canary-<unix>`) and asserts the **Active** status badge. In Cloud Run, durable ownership metadata is tagged immediately upon sandbox ID discovery (`tag_sandbox`). If tagging fails after bounded retries, the unowned sandbox is deleted synchronously and the run aborts.
 3. **Interactive Terminal Execution**: Opens the web terminal (xterm.js), evaluates a dynamic arithmetic expression in bash (`echo "RES_UI_$((<nonceA> + <nonceB>))"` with random 4-digit nonces), and verifies the computed sum (`RES_UI_<sum>`) to eliminate false positives from keystroke echoing or hardcoded outputs.
 4. **Pauses Sandbox**: Clicks Stop and asserts the **Paused** status badge.
 5. **Resumes Sandbox**: Clicks Start and asserts the **Active** status badge.
@@ -101,15 +101,34 @@ docker run --rm \
 ### Cloud Run Deployment & Terraform Infrastructure
 
 The UI canary is defined declaratively in Terraform under `infra/modules/ui_canary` and instantiated per environment (e.g. `infra/envs/staging/us-central1/main.tf`). It provisions:
-- A Cloud Run v2 Job configured with the Playwright runtime container, GCS target locking, and OTLP metrics.
+- A Cloud Run v2 Job configured with the dedicated Playwright runtime container (`ui_canary_image`), GCS target lease, and OTLP metrics.
 - A Cloud Scheduler job running on a 5-minute cron schedule (`*/5 * * * *`).
 - Secret Manager bindings for operator credentials, Vercel bypass (staging), and the Canary API key for durable ownership metadata tagging.
 
-Deployments are applied via Terraform:
+#### Safe Bootstrapping Sequence for New Targets
 
+To prevent automated failure alerts caused by empty Secret Manager containers referencing `version = "latest"` on fresh deployments, Cloud Scheduler defaults to disabled (`ui_scheduler_enabled = false`). Onboard new targets with this 3-step sequence:
+
+**Step 1: Apply Terraform with scheduler disabled (default)**
 ```bash
 cd infra/envs/staging/us-central1
-terraform apply
+terraform apply -var="ui_scheduler_enabled=false"
+```
+This creates the Cloud Run Job, IAM roles, and empty Secret Manager containers without scheduling automated runs. (In CI, image variables `image`, `load_runner_image`, and `ui_canary_image` are passed automatically by the deploy workflow).
+
+**Step 2: Populate Secret Manager versions out-of-band**
+```bash
+PROJECT_ID="rayai-dev"
+echo -n "canary-operator@superserve.ai" | gcloud secrets versions add ui-canary-email-staging-us-central1 --project="$PROJECT_ID" --data-file=-
+echo -n "operator-password-here" | gcloud secrets versions add ui-canary-password-staging-us-central1 --project="$PROJECT_ID" --data-file=-
+echo -n "vercel-bypass-secret-here" | gcloud secrets versions add ui-canary-vercel-bypass-staging-us-central1 --project="$PROJECT_ID" --data-file=-
+# If this is a fresh target without existing API canary key:
+echo -n "superserve-api-key-here" | gcloud secrets versions add api-canary-key-staging-us-central1 --project="$PROJECT_ID" --data-file=-
+```
+
+**Step 3: Enable the Cloud Scheduler job**
+```bash
+terraform apply -var="ui_scheduler_enabled=true"
 ```
 
 ## Target Inventory
@@ -127,19 +146,24 @@ Discovered from `sandbox`:
 
 Terraform creates secret containers only. Populate versions manually after apply.
 
-Expected secret names:
+Expected API canary secret names:
 - `api-canary-key-staging-us-central1`
 - `api-canary-key-production-us-central1`
 - `api-canary-key-production-us-east4`
 - `api-canary-key-production-us-west2`
 
-Each secret value must be a customer API key for a dedicated canary account or team.
+Expected UI canary secret names:
+- `ui-canary-email-staging-us-central1`
+- `ui-canary-password-staging-us-central1`
+- `ui-canary-vercel-bypass-staging-us-central1` (staging only)
+
+Each API canary secret value must be a customer API key for a dedicated canary account or team.
 
 Rotate credentials by:
-1. create a new API key in Superserve
+1. create a new API key / password in Superserve
 2. add a new Secret Manager version
 3. rerun the Cloud Run Job or wait for the next schedule
-4. revoke the old API key
+4. revoke the old API key / credential
 
 ## Local Execution
 

@@ -48,6 +48,7 @@ type RunResult struct {
 type sandboxIDTracker struct {
 	mu           sync.Mutex
 	id           string
+	err          error
 	onDiscovered func(string)
 }
 
@@ -76,6 +77,23 @@ func (t *sandboxIDTracker) Get() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.id
+}
+
+func (t *sandboxIDTracker) SetError(err error) {
+	if err == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.err == nil {
+		t.err = err
+	}
+}
+
+func (t *sandboxIDTracker) GetError() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
 }
 
 func (r Runner) now() time.Time {
@@ -114,7 +132,7 @@ func (r Runner) Run(ctx context.Context) error {
 		}
 		if outcome == lock.OutcomeAlreadyRunning {
 			r.metricsProvider().RecordOverlapSkip(ctx, env, region, target)
-			log.Info().Str("target", target).Msg("UI canary skipped because another run holds the target lock")
+			log.Info().Str("target", target).Msg("UI canary skipped because another run holds the target lease")
 			return nil
 		}
 		if lease != nil {
@@ -357,24 +375,57 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		res.FailedStep = "create_sandbox"
 		return res
 	}
+	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
 
 	// Tag the sandbox with ownership metadata so the janitor can reap it if this
-	// run crashes before the delete step. Best-effort: a tagging failure is logged
-	// but does not fail the canary run.
+	// run crashes before the delete step.
+	// Contract: Must retry up to 3 times. If tagging fails, delete the unowned sandbox
+	// synchronously and abort the canary run to prevent orphaned unowned sandboxes.
 	if r.Tagger != nil && activeID != "" {
+		tagStart := r.now()
 		tagMeta := sandboxmetadata.LegacyCanaryMetadata(
 			env, region, target, runID,
 			r.now(),
 			r.now().Add(r.Config.BaseConfig.RetainFailedSandboxTTL),
 		)
-		if tagErr := r.Tagger.TagSandbox(ctx, activeID, tagMeta); tagErr != nil {
-			log.Warn().Err(tagErr).Str("sandbox_id", activeID).Msg("failed to tag sandbox metadata; janitor cannot reap it if run fails")
-		} else {
-			log.Debug().Str("sandbox_id", activeID).Msg("sandbox tagged with canary ownership metadata")
+		var tagErr error
+		const maxTagAttempts = 3
+		for attempt := 1; attempt <= maxTagAttempts; attempt++ {
+			tagErr = r.Tagger.TagSandbox(ctx, activeID, tagMeta)
+			if tagErr == nil {
+				log.Debug().Str("sandbox_id", activeID).Int("attempt", attempt).Msg("sandbox tagged with canary ownership metadata")
+				break
+			}
+			log.Warn().Err(tagErr).Str("sandbox_id", activeID).Int("attempt", attempt).Msg("retryable failure tagging sandbox metadata")
+			if attempt < maxTagAttempts {
+				select {
+				case <-ctx.Done():
+					tagErr = ctx.Err()
+				case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+				}
+				if ctx.Err() != nil {
+					break
+				}
+			}
 		}
-	}
+		if tagErr != nil {
+			log.Error().Err(tagErr).Str("sandbox_id", activeID).Msg("failed to tag sandbox metadata after retries; deleting unowned sandbox synchronously to avoid orphan leak")
+			mp.RecordStep(ctx, env, region, target, scenario, "tag_sandbox", "failure", r.now().Sub(tagStart))
+			captureArtifacts("tag_sandbox")
 
-	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
+			// Synchronously delete the unowned sandbox immediately
+			if delErr := r.deleteSandboxInUI(page, activeID, sandboxName, stepTimeoutMs); delErr == nil {
+				markDeleted()
+			} else {
+				log.Error().Err(delErr).Str("sandbox_id", activeID).Msg("failed synchronous deletion of unowned sandbox after tag failure")
+			}
+
+			res.Err = fmt.Errorf("tag sandbox after %d attempts: %w", maxTagAttempts, tagErr)
+			res.FailedStep = "tag_sandbox"
+			return res
+		}
+		mp.RecordStep(ctx, env, region, target, scenario, "tag_sandbox", "success", r.now().Sub(tagStart))
+	}
 
 	// Step 3: Interactive Terminal Execution
 	termStart := r.now()
@@ -496,20 +547,51 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		}
 	})
 
-	// Intercept backend creation response to grab ID immediately on wire asynchronously.
+	// Intercept backend creation response to grab ID immediately on wire asynchronously,
+	// or capture rejection error code/message for fail-fast abort.
 	// NOTE: Must run inside a goroutine to avoid deadlocking the Playwright message reader.
 	responseHandler := func(res playwright.Response) {
-		go func(r playwright.Response) {
-			u := r.URL()
-			if strings.Contains(u, "/sandboxes") && r.Request().Method() == "POST" && r.Status() >= 200 && r.Status() < 300 {
-				body, err := r.Body()
-				if err == nil {
-					var data struct {
-						ID string `json:"id"`
+		go func(resObj playwright.Response) {
+			u := resObj.URL()
+			cleanURL := strings.TrimRight(strings.Split(u, "?")[0], "/")
+			isCreateEndpoint := cleanURL == "/sandboxes" || strings.HasSuffix(cleanURL, "/sandboxes")
+			if isCreateEndpoint && resObj.Request().Method() == "POST" {
+				if resObj.Status() >= 200 && resObj.Status() < 300 {
+					body, err := resObj.Body()
+					if err == nil {
+						var data struct {
+							ID string `json:"id"`
+						}
+						if err := json.Unmarshal(body, &data); err == nil && data.ID != "" {
+							tracker.Set(data.ID)
+						}
 					}
-					if err := json.Unmarshal(body, &data); err == nil && data.ID != "" {
-						tracker.Set(data.ID)
+				} else if resObj.Status() >= 400 {
+					body, err := resObj.Body()
+					var msg string
+					if err == nil && len(body) > 0 {
+						var errObj struct {
+							Message string `json:"message"`
+							Error   string `json:"error"`
+							Detail  string `json:"detail"`
+						}
+						if json.Unmarshal(body, &errObj) == nil {
+							if errObj.Message != "" {
+								msg = errObj.Message
+							} else if errObj.Error != "" {
+								msg = errObj.Error
+							} else if errObj.Detail != "" {
+								msg = errObj.Detail
+							}
+						}
+						if msg == "" {
+							msg = strings.TrimSpace(string(body))
+						}
 					}
+					if msg == "" {
+						msg = fmt.Sprintf("HTTP %d %s", resObj.Status(), resObj.StatusText())
+					}
+					tracker.SetError(fmt.Errorf("backend rejected sandbox creation (%d): %s", resObj.Status(), msg))
 				}
 			}
 		}(res)
@@ -530,6 +612,12 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 	// Wait up to timeout for ConnectSandboxDialog, direct detail navigation, or table row appearance
 	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(pollDeadline) {
+		// Fail fast if backend rejected creation or if UI displays error toast/alert/validation
+		if err := checkCreationError(tracker, page); err != nil {
+			log.Error().Err(err).Msg("sandbox creation failed with rejection")
+			return "", err
+		}
+
 		// 1. Check if ConnectSandboxDialog appeared with "Open Terminal"
 		if count, _ := openTerminalBtn.Count(); count > 0 {
 			if visible, _ := openTerminalBtn.IsVisible(); visible {
@@ -585,8 +673,12 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 5. Fallback: navigate directly to sandboxes list and find row
+	// 5. Fallback: navigate directly to sandboxes list and find row only if no backend/UI errors
 	if tracker.Get() == "" {
+		if err := checkCreationError(tracker, page); err != nil {
+			return "", err
+		}
+
 		listURL := fmt.Sprintf("%s/sandboxes/", r.Config.ConsoleURL)
 		_, _ = page.Goto(listURL, playwright.PageGotoOptions{
 			Timeout:   playwright.Float(timeoutMs),
@@ -605,6 +697,9 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 
 	finalID := tracker.Get()
 	if finalID == "" {
+		if err := checkCreationError(tracker, page); err != nil {
+			return "", err
+		}
 		return "", fmt.Errorf("could not extract sandbox ID after creation")
 	}
 
@@ -624,6 +719,9 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 	log.Info().Str("sandbox_id", finalID).Msg("waiting for sandbox to become active")
 	activeDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(activeDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return finalID, fmt.Errorf("sandbox active state error: %s", uiErr)
+		}
 		activeBadge := page.Locator("section:has-text('Active'), span:has-text('Active'), td:has-text('Active'), div:has-text('Active')").First()
 		if count, _ := activeBadge.Count(); count > 0 {
 			if visible, _ := activeBadge.IsVisible(); visible {
@@ -821,16 +919,22 @@ func (r Runner) pauseSandboxInUI(page playwright.Page, sandboxID string, timeout
 		return fmt.Errorf("click Stop button: %w", err)
 	}
 
-	// Wait for status hero to report "Paused"
+	// Wait for status hero to report "Paused", checking for UI error alerts/toasts
 	pausedBadge := page.Locator("section:has-text('Paused'), span:has-text('Paused'), td:has-text('Paused')").First()
-	if err := pausedBadge.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(timeoutMs),
-	}); err != nil {
-		return fmt.Errorf("waiting for Paused status: %w", err)
+	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for r.now().Before(pollDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("pause sandbox rejected: %s", uiErr)
+		}
+		if count, _ := pausedBadge.Count(); count > 0 {
+			if visible, _ := pausedBadge.IsVisible(); visible {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	return nil
+	return fmt.Errorf("waiting for Paused status timed out")
 }
 
 func (r Runner) resumeSandboxInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {
@@ -856,16 +960,22 @@ func (r Runner) resumeSandboxInUI(page playwright.Page, sandboxID string, timeou
 		return fmt.Errorf("click Start button: %w", err)
 	}
 
-	// Wait for status hero to report "Active"
+	// Wait for status hero to report "Active", checking for UI error alerts/toasts
 	activeBadge := page.Locator("section:has-text('Active'), span:has-text('Active'), td:has-text('Active')").First()
-	if err := activeBadge.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(timeoutMs),
-	}); err != nil {
-		return fmt.Errorf("waiting for Active status after resume: %w", err)
+	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for r.now().Before(pollDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("resume sandbox rejected: %s", uiErr)
+		}
+		if count, _ := activeBadge.Count(); count > 0 {
+			if visible, _ := activeBadge.IsVisible(); visible {
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	return nil
+	return fmt.Errorf("waiting for Active status after resume timed out")
 }
 
 func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName string, timeoutMs float64) error {
@@ -935,6 +1045,9 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 	deadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	clicked := false
 	for r.now().Before(deadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
+		}
 		disabled, err := deleteBtn.IsDisabled()
 		if err == nil && !disabled {
 			if err := deleteBtn.Click(); err == nil {
@@ -951,11 +1064,17 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 		return fmt.Errorf("confirm delete button remained disabled or could not be clicked")
 	}
 
-	// Wait for the delete dialog to close (indicates DELETE API call completed)
-	_ = dialog.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateHidden,
-		Timeout: playwright.Float(timeoutMs),
-	})
+	// Wait for the delete dialog to close while checking for UI rejection toasts
+	dialogCloseDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for r.now().Before(dialogCloseDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
+		}
+		if hidden, _ := dialog.IsHidden(); hidden {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 
 	// Wait for navigation away from the detail page back to the sandboxes dashboard
 	listURL := fmt.Sprintf("%s/sandboxes/", r.Config.ConsoleURL)
@@ -972,6 +1091,9 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 	time.Sleep(1 * time.Second)
 	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(pollDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
+		}
 		row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName)).First()
 		count, _ := row.Count()
 		if count == 0 {
@@ -1028,4 +1150,89 @@ func generateTerminalCommand() (command string, expectedOutput string) {
 	command = fmt.Sprintf(`echo "%s$((%d + %d))"`, terminalSentinelPrefix, nonceA, nonceB)
 	expectedOutput = fmt.Sprintf("%s%d", terminalSentinelPrefix, nonceA+nonceB)
 	return command, expectedOutput
+}
+
+func isVisibleWithText(loc playwright.Locator) bool {
+	if count, err := loc.Count(); err != nil || count == 0 {
+		return false
+	}
+	visible, err := loc.IsVisible()
+	return err == nil && visible
+}
+
+func checkForUIError(page playwright.Page) string {
+	// 1. Explicit Sonner error toast
+	sonnerErr := page.Locator("[data-sonner-toast][data-type='error'], [data-sonner-toast]:has(.text-destructive)").First()
+	if isVisibleWithText(sonnerErr) {
+		if txt, err := sonnerErr.InnerText(); err == nil {
+			clean := strings.TrimSpace(txt)
+			if clean != "" && clean != "*" {
+				return clean
+			}
+		}
+	}
+
+	// 2. Destructive alert callouts: role='alert' that contains destructive styling or is inside a modal dialog
+	alerts := page.Locator("[role='alert'].text-destructive, [role='alert'].border-destructive, [role='alert']:has(.text-destructive), [role='alert'][data-variant='destructive'], div[role='dialog'] [role='alert'], div[role='alertdialog'] [role='alert']")
+	if count, _ := alerts.Count(); count > 0 {
+		for i := 0; i < count; i++ {
+			alert := alerts.Nth(i)
+			if visible, err := alert.IsVisible(); err == nil && visible {
+				if txt, err := alert.InnerText(); err == nil {
+					clean := strings.TrimSpace(txt)
+					if clean != "" && clean != "*" {
+						return clean
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func checkDialogValidationError(page playwright.Page) string {
+	// Form error messages in dialog (excluding label asterisks and action buttons)
+	dialogErrors := page.Locator("div[role='dialog'] p.text-destructive, div[role='dialog'] [role='alert'], div[role='dialog'] .text-destructive:not(label *):not(label):not(button), div[role='alertdialog'] p.text-destructive, div[role='alertdialog'] [role='alert'], div[role='alertdialog'] .text-destructive:not(label *):not(label):not(button)")
+	count, _ := dialogErrors.Count()
+	for i := 0; i < count; i++ {
+		el := dialogErrors.Nth(i)
+		if isVisibleWithText(el) {
+			if txt, err := el.InnerText(); err == nil {
+				clean := strings.TrimSpace(txt)
+				if clean != "" && clean != "*" {
+					return clean
+				}
+			}
+		}
+	}
+
+	// Form inputs marked invalid
+	invalidInput := page.Locator("div[role='dialog'] input[aria-invalid='true'], div[role='alertdialog'] input[aria-invalid='true']").First()
+	if isVisibleWithText(invalidInput) {
+		if parent := invalidInput.Locator("..").First(); isVisibleWithText(parent) {
+			if txt, err := parent.InnerText(); err == nil {
+				clean := strings.TrimSpace(txt)
+				if clean != "" && clean != "*" {
+					return fmt.Sprintf("invalid input: %s", clean)
+				}
+			}
+		}
+		return "form input marked invalid"
+	}
+
+	return ""
+}
+
+func checkCreationError(tracker *sandboxIDTracker, page playwright.Page) error {
+	if backendErr := tracker.GetError(); backendErr != nil {
+		return backendErr
+	}
+	if uiErr := checkForUIError(page); uiErr != "" {
+		return fmt.Errorf("create sandbox rejected by UI: %s", uiErr)
+	}
+	if valErr := checkDialogValidationError(page); valErr != "" {
+		return fmt.Errorf("create sandbox validation error: %s", valErr)
+	}
+	return nil
 }

@@ -44,6 +44,11 @@ type mockServerState struct {
 	receivedBypassCookieHeader string
 	deletedSandbox             bool
 	failTerminal               bool
+	terminalCommandExecuted    bool
+	pausedSandbox              bool
+	resumedSandbox             bool
+	rejectPause                bool
+	rejectCreation             bool
 	externalURL                string
 	externalReceivedBypass     string
 	externalReceivedCookie     string
@@ -111,6 +116,18 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 			}
 		}
 		w.Header().Set("Content-Type", "text/html")
+		reject := false
+		if state != nil {
+			state.Lock()
+			reject = state.rejectCreation
+			state.Unlock()
+		}
+
+		submitAction := `document.getElementById('dialog').style.display='none'; document.getElementById('connect-dialog').style.display='block';`
+		if reject {
+			submitAction = `fetch('/api/sandboxes', {method: 'POST'}).catch(function(){}); document.getElementById('create-err-alert').style.display='block';`
+		}
+
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>Sandboxes</title></head>
@@ -120,7 +137,8 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 
   <div id="dialog" role="dialog" style="display:none;">
     <input type="text" placeholder="my-sandbox" id="name-input" />
-    <button id="submit-create" onclick="document.getElementById('dialog').style.display='none'; document.getElementById('connect-dialog').style.display='block';">Create Sandbox</button>
+    <div id="create-err-alert" role="alert" class="text-destructive" style="display:none;">Account quota exceeded. Upgrade required.</div>
+    <button id="submit-create" onclick="%s">Create Sandbox</button>
   </div>
 
   <div id="connect-dialog" role="dialog" style="display:none;">
@@ -132,11 +150,29 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
     <button onclick="document.getElementById('connect-dialog').style.display='none'">Done</button>
   </div>
 </body>
-</html>`)
+</html>`, submitAction)
+	})
+
+	mux.HandleFunc("/api/sandboxes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		fmt.Fprintln(w, `{"message":"Account quota exceeded. Upgrade required."}`)
 	})
 
 	mux.HandleFunc("/sandboxes/sb-mock-123/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
+		rejectPause := false
+		if state != nil {
+			state.Lock()
+			rejectPause = state.rejectPause
+			state.Unlock()
+		}
+
+		stopAction := `fetch('/pause-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('status-badge').innerText='Paused';`
+		if rejectPause {
+			stopAction = `fetch('/pause-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('pause-err-toast').style.display='block';`
+		}
+
 		fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>Sandbox Detail</title></head>
@@ -146,8 +182,9 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
     <span id="status-badge">%s</span>
   </section>
 
-  <button id="stop-btn" onclick="document.getElementById('status-badge').innerText='Paused'">Stop</button>
-  <button id="start-btn" onclick="document.getElementById('status-badge').innerText='Active'">Start</button>
+  <div id="pause-err-toast" data-sonner-toast="" data-type="error" style="display:none;">Failed to pause sandbox: operation rejected</div>
+  <button id="stop-btn" onclick="%s">Stop</button>
+  <button id="start-btn" onclick="fetch('/resume-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('status-badge').innerText='Active'">Start</button>
 
   <button aria-label="More actions" onclick="document.getElementById('menu').style.display='block'">More actions</button>
   <div id="menu" style="display:none;">
@@ -159,7 +196,34 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
     <button id="confirm-del" onclick="window.location.href='/sandboxes/?deleted=true'">Delete</button>
   </div>
 </body>
-</html>`, stateStatus)
+</html>`, stateStatus, stopAction)
+	})
+
+	mux.HandleFunc("/pause-sandbox", func(w http.ResponseWriter, r *http.Request) {
+		if state != nil {
+			state.Lock()
+			state.pausedSandbox = true
+			state.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/resume-sandbox", func(w http.ResponseWriter, r *http.Request) {
+		if state != nil {
+			state.Lock()
+			state.resumedSandbox = true
+			state.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/terminal-command", func(w http.ResponseWriter, r *http.Request) {
+		if state != nil {
+			state.Lock()
+			state.terminalCommandExecuted = true
+			state.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	mux.HandleFunc("/sandboxes/sb-mock-123/terminal/", func(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +256,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
     });
     window.addEventListener('keydown', function(e) {
       if (e.key === 'Enter') {
+        fetch('/terminal-command', {method: 'POST'}).catch(function(){});
         var lines = document.querySelector('.xterm-rows');
         var div = document.createElement('div');
         var val = ta.value;
@@ -235,13 +300,13 @@ func skipIfPlaywrightUnavailable(t *testing.T) {
 	t.Helper()
 	pw, err := playwright.Run()
 	if err != nil {
-		t.Skipf("skipping browser test: playwright driver unavailable: %v", err)
+		t.Skipf("skipping UI canary test: playwright driver unavailable: %v", err)
 		return
 	}
 	defer pw.Stop()
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Headless: playwright.Bool(true)})
 	if err != nil {
-		t.Skipf("skipping browser test: chromium browser unavailable: %v", err)
+		t.Skipf("skipping UI canary test: chromium browser unavailable: %v", err)
 		return
 	}
 	_ = browser.Close()
@@ -529,5 +594,135 @@ func TestConcurrentIDDiscoveryRace(t *testing.T) {
 	defer mu.Unlock()
 	if firstDiscoveredID != finalID {
 		t.Fatalf("expected discovered ID %q to match final ID %q", firstDiscoveredID, finalID)
+	}
+}
+
+func TestCreationRejectionFailFast(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{rejectCreation: true}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 15 * time.Second // High timeout; fail-fast should abort in < 6s
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := runner.Run(ctx)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected runner to fail on rejected creation")
+	}
+
+	if !strings.Contains(err.Error(), "Account quota exceeded") && !strings.Contains(err.Error(), "rejected") {
+		t.Errorf("expected error message to contain causal rejection info, got: %v", err)
+	}
+
+	if duration > 12*time.Second {
+		t.Errorf("expected fail-fast abort well before 15s timeout, took %v", duration)
+	}
+}
+
+func TestFailClosedTaggingRetryAndCleanup(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 5 * time.Second
+
+	var tagAttempts int32
+	mockTagger := &mockSandboxTagger{
+		tagFn: func(ctx context.Context, sandboxID string, metadata map[string]string) error {
+			atomic.AddInt32(&tagAttempts, 1)
+			return fmt.Errorf("simulated metadata tagging 500 error")
+		},
+	}
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+		Tagger:  mockTagger,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail when tagging fails")
+	}
+
+	if attempts := atomic.LoadInt32(&tagAttempts); attempts != 3 {
+		t.Errorf("expected exactly 3 tagging attempts, got %d", attempts)
+	}
+
+	if !strings.Contains(err.Error(), "tag sandbox after 3 attempts") {
+		t.Errorf("expected error to cite tagging failure after 3 attempts, got: %v", err)
+	}
+
+	state.Lock()
+	deleted := state.deletedSandbox
+	terminalHit := state.terminalCommandExecuted
+	pausedHit := state.pausedSandbox
+	resumedHit := state.resumedSandbox
+	state.Unlock()
+
+	if !deleted {
+		t.Errorf("expected unowned sandbox to be deleted synchronously immediately after tagging failure")
+	}
+	if terminalHit {
+		t.Errorf("expected terminal execution to NEVER be invoked after tagging failure")
+	}
+	if pausedHit {
+		t.Errorf("expected pause step to NEVER be invoked after tagging failure")
+	}
+	if resumedHit {
+		t.Errorf("expected resume step to NEVER be invoked after tagging failure")
+	}
+}
+
+func TestPauseRejectionFailFast(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{rejectPause: true}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 10 * time.Second
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail on pause rejection toast")
+	}
+
+	if !strings.Contains(err.Error(), "Failed to pause sandbox") && !strings.Contains(err.Error(), "operation rejected") {
+		t.Errorf("expected error message to contain pause rejection causal info, got: %v", err)
 	}
 }

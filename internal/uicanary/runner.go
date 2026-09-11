@@ -126,7 +126,8 @@ func (r Runner) Run(ctx context.Context) error {
 	}
 
 	if r.Locker != nil {
-		outcome, lease, err := r.Locker.Acquire(ctx, target, lockTTL)
+		lockKey := fmt.Sprintf("%s-ui", target)
+		outcome, lease, err := r.Locker.Acquire(ctx, lockKey, lockTTL)
 		if err != nil {
 			return fmt.Errorf("acquire lock: %w", err)
 		}
@@ -290,11 +291,14 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		}
 		_ = os.MkdirAll(r.Config.ArtifactsDir, 0755)
 		screenshotPath := filepath.Join(r.Config.ArtifactsDir, fmt.Sprintf("failure-%s-%s.png", stepName, runID))
-		_, _ = page.Screenshot(playwright.PageScreenshotOptions{
+		if _, err := page.Screenshot(playwright.PageScreenshotOptions{
 			Path:     playwright.String(screenshotPath),
 			FullPage: playwright.Bool(true),
-		})
-		log.Info().Str("screenshot", screenshotPath).Msg("captured failure screenshot")
+		}); err != nil {
+			log.Warn().Err(err).Str("screenshot", screenshotPath).Msg("failed to capture failure screenshot")
+		} else {
+			log.Info().Str("screenshot", screenshotPath).Msg("captured failure screenshot")
+		}
 	}
 
 	stepTimeout := r.Config.StepTimeout
@@ -375,7 +379,6 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		res.FailedStep = "create_sandbox"
 		return res
 	}
-	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
 
 	// Tag the sandbox with ownership metadata so the janitor can reap it if this
 	// run crashes before the delete step.
@@ -431,11 +434,13 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Runs only after durable ownership tagging has completed.
 	readyStart := r.now()
 	if err := r.waitForSandboxReadyInUI(page, activeID, stepTimeoutMs); err != nil {
+		mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "failure", r.now().Sub(createStart))
 		captureArtifacts("create_sandbox")
 		res.Err = fmt.Errorf("sandbox UI readiness: %w", err)
 		res.FailedStep = "create_sandbox"
 		return res
 	}
+	mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "success", r.now().Sub(createStart))
 	log.Info().Dur("duration", r.now().Sub(readyStart)).Msg("sandbox UI readiness confirmed")
 
 	// Step 3: Interactive Terminal Execution
@@ -840,7 +845,11 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 	}
 
 	// 1. Wait for terminal WebSocket to connect and prompt to be ready (recovering from any transient "connection lost")
-	readyDeadline := r.now().Add(30 * time.Second)
+	promptTimeout := 30 * time.Second
+	if timeout > 0 && timeout < promptTimeout {
+		promptTimeout = timeout
+	}
+	readyDeadline := r.now().Add(promptTimeout)
 	promptReady := false
 	for r.now().Before(readyDeadline) {
 		text := extractTerminalText()
@@ -853,7 +862,7 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 	}
 
 	if !promptReady {
-		log.Warn().Str("sandbox_id", sandboxID).Msg("shell prompt did not appear within 30s, proceeding to attempt execution")
+		log.Warn().Str("sandbox_id", sandboxID).Dur("timeout", promptTimeout).Msg("shell prompt did not appear within prompt timeout, proceeding to attempt execution")
 	}
 
 	helperTextarea := page.Locator(".xterm-helper-textarea").First()
@@ -981,7 +990,7 @@ func (r Runner) resumeSandboxInUI(page playwright.Page, sandboxID string, timeou
 	}
 
 	// Wait for status hero to report "Active", checking for UI error alerts/toasts
-	activeBadge := page.Locator("section:has-text('Active'), span:has-text('Active'), td:has-text('Active')").First()
+	activeBadge := page.Locator("section:has-text('Active'), #hero:has-text('Active'), span[data-status='active'], span[data-status='Active']").First()
 	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(pollDeadline) {
 		if uiErr := checkForUIError(page); uiErr != "" {
@@ -1112,7 +1121,7 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 	}); err != nil {
 		_, _ = page.Goto(listURL, playwright.PageGotoOptions{
 			Timeout:   playwright.Float(timeoutMs),
-			WaitUntil: playwright.WaitUntilStateNetworkidle,
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		})
 	}
 

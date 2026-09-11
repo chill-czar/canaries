@@ -51,6 +51,7 @@ type mockServerState struct {
 	rejectResume               bool
 	rejectDelete               bool
 	rejectCreation             bool
+	initialStatus              string
 	externalURL                string
 	externalReceivedBypass     string
 	externalReceivedCookie     string
@@ -65,6 +66,13 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 
 	mux := http.NewServeMux()
 	var stateStatus = "Active"
+	if state != nil {
+		state.Lock()
+		if state.initialStatus != "" {
+			stateStatus = state.initialStatus
+		}
+		state.Unlock()
+	}
 
 	mux.HandleFunc("/auth/signin", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -259,7 +267,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 <head><title>Terminal</title></head>
 <body>
   <div class="header">
-    <span id="status-badge">Active</span>
+    <span id="status-badge">%s</span>
     <a href="/sandboxes/sb-mock-123/">ui-canary-test</a>
   </div>
   <div class="xterm" style="position:relative; width:100vw; height:100vh;" onclick="document.querySelector('.xterm-helper-textarea').focus()">
@@ -295,7 +303,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
     });
   </script>
 </body>
-</html>`, shouldFail)
+</html>`, stateStatus, shouldFail)
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -803,5 +811,282 @@ func TestDeleteRejectionFailFast(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "delete sandbox rejected") && !strings.Contains(err.Error(), "Failed to delete sandbox") {
 		t.Errorf("expected error message to contain delete rejection causal info, got: %v", err)
+	}
+}
+
+type recordLocker struct {
+	mu          sync.Mutex
+	acquiredKey string
+	ttl         time.Duration
+}
+
+func (l *recordLocker) Acquire(_ context.Context, key string, ttl time.Duration) (lock.Outcome, lock.Lease, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.acquiredKey = key
+	l.ttl = ttl
+	return lock.OutcomeAlreadyRunning, nil, nil
+}
+
+func TestUILockKeyIsolation(t *testing.T) {
+	locker := &recordLocker{}
+	cfg := Config{
+		BaseConfig: config.Config{
+			Target: "staging-us-central1",
+		},
+	}
+	runner := Runner{
+		Config: cfg,
+		Locker: locker,
+	}
+
+	err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil error on OutcomeAlreadyRunning, got: %v", err)
+	}
+
+	locker.mu.Lock()
+	gotKey := locker.acquiredKey
+	locker.mu.Unlock()
+
+	wantKey := "staging-us-central1-ui"
+	if gotKey != wantKey {
+		t.Fatalf("acquired lock key = %q, want %q", gotKey, wantKey)
+	}
+}
+
+func TestAuthenticateDelayedRedirect(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	var (
+		mu                 sync.Mutex
+		clientRedirectDone bool
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/signin", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "text/html")
+			// Delayed JS redirect at 4s.
+			// Prior to the fix, the polling loop called page.Goto after 3s,
+			// which aborted in-flight redirects. With the fix, client redirect succeeds.
+			fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>Authenticating</title></head>
+<body>
+  <p>Authenticating session...</p>
+  <script>
+    setTimeout(function() {
+      window.location.href = '/sandboxes/?via=client-redirect';
+    }, 4000);
+  </script>
+</body>
+</html>`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>Sign In</title></head>
+<body>
+  <form method="POST" action="/auth/signin">
+    <input type="email" placeholder="Email" name="email" value="" />
+    <input type="password" placeholder="Password" name="password" value="" />
+    <button type="submit">Sign In</button>
+  </form>
+</body>
+</html>`)
+	})
+
+	mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("via") == "client-redirect" {
+			mu.Lock()
+			clientRedirectDone = true
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<!DOCTYPE html><html><body><h1>Sandboxes</h1></body></html>`)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	pw, err := playwright.Run()
+	if err != nil {
+		t.Fatalf("playwright run: %v", err)
+	}
+	defer pw.Stop()
+
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("chromium launch: %v", err)
+	}
+	defer browser.Close()
+
+	page, err := browser.NewPage()
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	defer page.Close()
+
+	cfg := Config{
+		ConsoleURL:  server.URL,
+		Email:       "test@example.com",
+		Password:    "password",
+		StepTimeout: 10 * time.Second,
+	}
+
+	err = Authenticate(context.Background(), page, cfg)
+	if err != nil {
+		t.Fatalf("expected Authenticate to succeed with delayed redirect, got: %v", err)
+	}
+
+	mu.Lock()
+	viaClient := clientRedirectDone
+	mu.Unlock()
+	if !viaClient {
+		t.Fatalf("expected redirect to be initiated by client script (?via=client-redirect)")
+	}
+}
+
+func TestResumeIgnoresTableActiveCell(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sandboxes/sb-test-table/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		// Status hero displays 'Paused', but audit table has a cell with 'Active'.
+		// The locator should ignore the table cell and not falsely report active.
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>Sandbox Detail</title></head>
+<body>
+  <section id="hero">
+    <h1>sandbox-table-test</h1>
+    <span id="status-badge">Paused</span>
+  </section>
+  <button id="start-btn">Start</button>
+  <div id="events">
+    <table>
+      <thead><tr><th>Event</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>Created</td><td>Active</td></tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>`)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	pw, err := playwright.Run()
+	if err != nil {
+		t.Fatalf("playwright run: %v", err)
+	}
+	defer pw.Stop()
+
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("chromium launch: %v", err)
+	}
+	defer browser.Close()
+
+	page, err := browser.NewPage()
+	if err != nil {
+		t.Fatalf("new page: %v", err)
+	}
+	defer page.Close()
+
+	runner := Runner{
+		Config: Config{
+			ConsoleURL: server.URL,
+		},
+		Clock: time.Now,
+	}
+
+	// 1 second timeout.
+	// If locator matched td:has-text('Active'), resumeSandboxInUI would immediately return nil.
+	err = runner.resumeSandboxInUI(page, "sb-test-table", 1000)
+	if err == nil {
+		t.Fatal("expected resumeSandboxInUI to time out ignoring td:has-text('Active'); got nil")
+	}
+	if !strings.Contains(err.Error(), "waiting for Active status after resume timed out") {
+		t.Fatalf("expected timeout error, got: %v", err)
+	}
+}
+
+type stepMetricsRecorder struct {
+	metrics.NoopProvider
+	mu    sync.Mutex
+	steps []recordedStep
+}
+
+type recordedStep struct {
+	step   string
+	result string
+}
+
+func (r *stepMetricsRecorder) RecordStep(_ context.Context, _, _, _, _, step, result string, _ time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.steps = append(r.steps, recordedStep{step: step, result: result})
+}
+
+func TestCreateSandboxStepMetricReadinessFailure(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	// Set initialStatus to "Provisioning" so detail page never shows "Active"
+	state := &mockServerState{initialStatus: "Provisioning"}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	recorder := &stepMetricsRecorder{}
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 1500 * time.Millisecond
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: recorder,
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail on sandbox UI readiness timeout")
+	}
+
+	if !strings.Contains(err.Error(), "sandbox UI readiness") {
+		t.Errorf("expected error to mention sandbox UI readiness, got: %v", err)
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	var createSandboxSuccessCount, createSandboxFailureCount int
+	for _, s := range recorder.steps {
+		if s.step == "create_sandbox" {
+			if s.result == "success" {
+				createSandboxSuccessCount++
+			} else if s.result == "failure" {
+				createSandboxFailureCount++
+			}
+		}
+	}
+
+	if createSandboxSuccessCount != 0 {
+		t.Errorf("expected 0 create_sandbox success metrics, got %d", createSandboxSuccessCount)
+	}
+	if createSandboxFailureCount != 1 {
+		t.Errorf("expected 1 create_sandbox failure metric, got %d", createSandboxFailureCount)
 	}
 }

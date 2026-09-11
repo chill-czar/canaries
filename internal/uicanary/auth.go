@@ -14,7 +14,8 @@ import (
 func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 	log.Info().Str("email", maskEmail(cfg.Email)).Msg("authenticating UI canary via email/password form")
 
-	signinURL := cfg.ConsoleURL + "/auth/signin"
+	baseURL := strings.TrimRight(cfg.ConsoleURL, "/")
+	signinURL := baseURL + "/auth/signin?next=/sandboxes/"
 	if _, err := page.Goto(signinURL, playwright.PageGotoOptions{
 		Timeout:   playwright.Float(float64(cfg.StepTimeout.Milliseconds())),
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
@@ -55,8 +56,9 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 	time.Sleep(3 * time.Second)
 
 	// Poll until redirected to sandboxes, checking for error alerts
-	sandboxesURL := cfg.ConsoleURL + "/sandboxes/"
+	sandboxesURL := baseURL + "/sandboxes/"
 	deadline := time.Now().Add(cfg.StepTimeout)
+	fallbackAttempted := false
 	for time.Now().Before(deadline) {
 		if strings.Contains(page.URL(), "/sandboxes") {
 			return nil
@@ -74,8 +76,10 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 			}
 		}
 
-		// Navigate to sandboxes dashboard
-		if strings.Contains(page.URL(), "/auth/signin") {
+		// Fallback: If still on signin after initial wait and no error alert,
+		// trigger a single navigation to sandboxes dashboard to recover if client SPA router stalled.
+		if !fallbackAttempted && time.Now().After(deadline.Add(-cfg.StepTimeout+4*time.Second)) && strings.Contains(page.URL(), "/auth/signin") {
+			fallbackAttempted = true
 			_, _ = page.Goto(sandboxesURL, playwright.PageGotoOptions{
 				Timeout:   playwright.Float(timeoutMs),
 				WaitUntil: playwright.WaitUntilStateDomcontentloaded,

@@ -50,6 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build -t api-canary:ci .
+          docker build --target ui-canary -t ui-canary:ci .
 
       - name: Terraform init and validate production
         run: |
@@ -62,6 +63,13 @@ jobs:
         run: |
           set -euo pipefail
           cd infra/envs/production/us-east4
+          terraform init -backend=false
+          terraform validate
+
+      - name: Terraform init and validate staging central
+        run: |
+          set -euo pipefail
+          cd infra/envs/staging/us-central1
           terraform init -backend=false
           terraform validate
       - name: Install Gitleaks

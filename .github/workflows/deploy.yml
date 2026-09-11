@@ -144,7 +144,8 @@ jobs:
             -auto-approve \
             -var="image=${{ steps.image.outputs.image }}" \
             -var="load_runner_image=${{ steps.image.outputs.image }}" \
-            -var="ui_canary_image=${{ steps.ui_image.outputs.image }}"
+            -var="ui_canary_image=${{ steps.ui_image.outputs.image }}" \
+            -var="ui_scheduler_enabled=true"
 
   deploy-production:
     runs-on: ubuntu-latest

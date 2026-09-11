@@ -106,10 +106,10 @@ The UI canary is defined declaratively in Terraform under `infra/modules/ui_cana
 - Secret Manager bindings for operator credentials, Vercel bypass (staging), and the Canary API key for durable ownership metadata tagging.
 
 #### Safe Bootstrapping Sequence for New Targets
-
-To prevent automated failure alerts caused by empty Secret Manager containers referencing `version = "latest"` on fresh deployments, Cloud Scheduler defaults to disabled (`ui_scheduler_enabled = false`). Onboard new targets with this 3-step sequence:
-
-**Step 1: Apply Terraform with scheduler disabled (default)**
+ 
+For established deployments with provisioned Secret Manager versions, Cloud Scheduler is enabled by default (`ui_scheduler_enabled = true`). When onboarding a brand new target environment, disable the scheduler initially to prevent failure alerts prior to populating secrets:
+ 
+**Step 1: Apply Terraform with scheduler disabled (for fresh onboarding)**
 ```bash
 cd infra/envs/staging/us-central1
 terraform apply -var="ui_scheduler_enabled=false"
@@ -126,10 +126,11 @@ echo -n "vercel-bypass-secret-here" | gcloud secrets versions add ui-canary-verc
 echo -n "superserve-api-key-here" | gcloud secrets versions add api-canary-key-staging-us-central1 --project="$PROJECT_ID" --data-file=-
 ```
 
-**Step 3: Enable the Cloud Scheduler job**
+**Step 3: Enable the Cloud Scheduler job (default)**
 ```bash
-terraform apply -var="ui_scheduler_enabled=true"
+terraform apply
 ```
+(Or `-var="ui_scheduler_enabled=true"`). Normal CI deployments will henceforth maintain the scheduler as enabled.
 
 ## Target Inventory
 

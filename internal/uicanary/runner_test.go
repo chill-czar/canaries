@@ -48,6 +48,8 @@ type mockServerState struct {
 	pausedSandbox              bool
 	resumedSandbox             bool
 	rejectPause                bool
+	rejectResume               bool
+	rejectDelete               bool
 	rejectCreation             bool
 	externalURL                string
 	externalReceivedBypass     string
@@ -134,6 +136,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 <body>
   <h1>Sandboxes</h1>
   <button id="create-btn" onclick="document.getElementById('dialog').style.display='block'">Create sandbox</button>
+  <table id="sandboxes-table"><tbody><tr><td>Ready</td></tr></tbody></table>
 
   <div id="dialog" role="dialog" style="display:none;">
     <input type="text" placeholder="my-sandbox" id="name-input" />
@@ -162,15 +165,29 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 	mux.HandleFunc("/sandboxes/sb-mock-123/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		rejectPause := false
+		rejectResume := false
+		rejectDelete := false
 		if state != nil {
 			state.Lock()
 			rejectPause = state.rejectPause
+			rejectResume = state.rejectResume
+			rejectDelete = state.rejectDelete
 			state.Unlock()
 		}
 
 		stopAction := `fetch('/pause-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('status-badge').innerText='Paused';`
 		if rejectPause {
 			stopAction = `fetch('/pause-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('pause-err-toast').style.display='block';`
+		}
+
+		startAction := `fetch('/resume-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('status-badge').innerText='Active';`
+		if rejectResume {
+			startAction = `fetch('/resume-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('resume-err-toast').style.display='block';`
+		}
+
+		deleteAction := `window.location.href='/sandboxes/?deleted=true'`
+		if rejectDelete {
+			deleteAction = `document.getElementById('delete-err-toast').style.display='block';`
 		}
 
 		fmt.Fprintf(w, `<!DOCTYPE html>
@@ -183,8 +200,10 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
   </section>
 
   <div id="pause-err-toast" data-sonner-toast="" data-type="error" style="display:none;">Failed to pause sandbox: operation rejected</div>
+  <div id="resume-err-toast" data-sonner-toast="" data-type="error" style="display:none;">Failed to resume sandbox: operation rejected</div>
+  <div id="delete-err-toast" data-sonner-toast="" data-type="error" style="display:none;">delete sandbox rejected: Failed to delete sandbox: operation rejected</div>
   <button id="stop-btn" onclick="%s">Stop</button>
-  <button id="start-btn" onclick="fetch('/resume-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('status-badge').innerText='Active'">Start</button>
+  <button id="start-btn" onclick="%s">Start</button>
 
   <button aria-label="More actions" onclick="document.getElementById('menu').style.display='block'">More actions</button>
   <div id="menu" style="display:none;">
@@ -193,10 +212,10 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 
   <div id="delete-dialog" role="dialog" style="display:none;">
     <input placeholder="ui-canary-mock" id="delete-input" />
-    <button id="confirm-del" onclick="window.location.href='/sandboxes/?deleted=true'">Delete</button>
+    <button id="confirm-del" onclick="%s">Delete</button>
   </div>
 </body>
-</html>`, stateStatus, stopAction)
+</html>`, stateStatus, stopAction, startAction, deleteAction)
 	})
 
 	mux.HandleFunc("/pause-sandbox", func(w http.ResponseWriter, r *http.Request) {
@@ -724,5 +743,65 @@ func TestPauseRejectionFailFast(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "Failed to pause sandbox") && !strings.Contains(err.Error(), "operation rejected") {
 		t.Errorf("expected error message to contain pause rejection causal info, got: %v", err)
+	}
+}
+
+func TestResumeRejectionFailFast(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{rejectResume: true}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 10 * time.Second
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail on resume rejection toast")
+	}
+
+	if !strings.Contains(err.Error(), "Failed to resume sandbox") && !strings.Contains(err.Error(), "operation rejected") {
+		t.Errorf("expected error message to contain resume rejection causal info, got: %v", err)
+	}
+}
+
+func TestDeleteRejectionFailFast(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+
+	state := &mockServerState{rejectDelete: true}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.StepTimeout = 10 * time.Second
+
+	runner := Runner{
+		Config:  cfg,
+		Locker:  lock.NoopLock{},
+		Metrics: metrics.NoopProvider{},
+		Clock:   time.Now,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	err := runner.Run(ctx)
+	if err == nil {
+		t.Fatal("expected runner to fail on delete rejection toast")
+	}
+
+	if !strings.Contains(err.Error(), "delete sandbox rejected") && !strings.Contains(err.Error(), "Failed to delete sandbox") {
+		t.Errorf("expected error message to contain delete rejection causal info, got: %v", err)
 	}
 }

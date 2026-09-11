@@ -427,6 +427,17 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		mp.RecordStep(ctx, env, region, target, scenario, "tag_sandbox", "success", r.now().Sub(tagStart))
 	}
 
+	// Step 2b: Wait for UI readiness (dismiss connect modal, navigate to detail, wait for Active)
+	// Runs only after durable ownership tagging has completed.
+	readyStart := r.now()
+	if err := r.waitForSandboxReadyInUI(page, activeID, stepTimeoutMs); err != nil {
+		captureArtifacts("create_sandbox")
+		res.Err = fmt.Errorf("sandbox UI readiness: %w", err)
+		res.FailedStep = "create_sandbox"
+		return res
+	}
+	log.Info().Dur("duration", r.now().Sub(readyStart)).Msg("sandbox UI readiness confirmed")
+
 	// Step 3: Interactive Terminal Execution
 	termStart := r.now()
 	log.Info().Msg("UI step: terminal_exec")
@@ -623,18 +634,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			if visible, _ := openTerminalBtn.IsVisible(); visible {
 				if id := extractSandboxIDFromDialog(page); id != "" {
 					tracker.Set(id)
-				}
-				_ = openTerminalBtn.Click()
-				currentID := tracker.Get()
-				log.Info().Str("sandbox_id", currentID).Msg("clicked Open Terminal; waiting for navigation to terminal")
-				if currentID != "" {
-					_ = page.WaitForURL(fmt.Sprintf("%s/sandboxes/%s/**", r.Config.ConsoleURL, currentID), playwright.PageWaitForURLOptions{
-						Timeout: playwright.Float(5000),
-					})
-				}
-				if id := extractSandboxIDFromURL(page.URL()); id != "" {
-					tracker.Set(id)
-					break
+					return tracker.Get(), nil
 				}
 			}
 		}
@@ -642,7 +642,7 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		// 2. Check if URL already contains sandbox ID
 		if id := extractSandboxIDFromURL(page.URL()); id != "" {
 			tracker.Set(id)
-			break
+			return tracker.Get(), nil
 		}
 
 		// 3. If Done button appeared without Open Terminal (fallback), inspect snippet then dismiss
@@ -650,8 +650,8 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			if visible, _ := doneBtn.IsVisible(); visible {
 				if id := extractSandboxIDFromDialog(page); id != "" {
 					tracker.Set(id)
+					return tracker.Get(), nil
 				}
-				_ = doneBtn.Click()
 			}
 		}
 
@@ -662,15 +662,15 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			time.Sleep(500 * time.Millisecond)
 			if id := extractSandboxIDFromURL(page.URL()); id != "" {
 				tracker.Set(id)
-				break
+				return tracker.Get(), nil
 			}
 		}
 
-		if tracker.Get() != "" {
-			break
+		if id := tracker.Get(); id != "" {
+			return id, nil
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	// 5. Fallback: navigate directly to sandboxes list and find row only if no backend/UI errors
@@ -703,37 +703,57 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		return "", fmt.Errorf("could not extract sandbox ID after creation")
 	}
 
-	// Navigate to sandbox detail page if not already on a sandbox page
-	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, finalID)) {
-		detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, finalID)
+	return finalID, nil
+}
+
+func (r Runner) waitForSandboxReadyInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {
+	// 1. Dismiss ConnectSandboxDialog actions if still visible
+	openTerminalBtn := page.Locator("div[role='dialog'] button:has-text('Open Terminal'), .dialog-popup button:has-text('Open Terminal'), button:has-text('Open Terminal')").First()
+	doneBtn := page.Locator("div[role='dialog'] button:has-text('Done'), .dialog-popup button:has-text('Done'), button:has-text('Done')").First()
+	if count, _ := openTerminalBtn.Count(); count > 0 {
+		if visible, _ := openTerminalBtn.IsVisible(); visible {
+			_ = openTerminalBtn.Click()
+			_ = page.WaitForURL(fmt.Sprintf("%s/sandboxes/%s/**", r.Config.ConsoleURL, sandboxID), playwright.PageWaitForURLOptions{
+				Timeout: playwright.Float(5000),
+			})
+		}
+	} else if count, _ := doneBtn.Count(); count > 0 {
+		if visible, _ := doneBtn.IsVisible(); visible {
+			_ = doneBtn.Click()
+		}
+	}
+
+	// 2. Navigate to sandbox detail page if not already on a sandbox page
+	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, sandboxID)) {
+		detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, sandboxID)
 		if _, err := page.Goto(detailURL, playwright.PageGotoOptions{
 			Timeout:   playwright.Float(timeoutMs),
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		}); err != nil {
-			return finalID, fmt.Errorf("navigate to detail page %s: %w", detailURL, err)
+			return fmt.Errorf("navigate to detail page %s: %w", detailURL, err)
 		}
 	}
 
-	// Wait for "Active" status indicator in SandboxStatusHero or Terminal header,
+	// 3. Wait for "Active" status indicator in SandboxStatusHero or Terminal header,
 	// periodically dispatching window focus event to prompt React Query to refetch
-	log.Info().Str("sandbox_id", finalID).Msg("waiting for sandbox to become active")
+	log.Info().Str("sandbox_id", sandboxID).Msg("waiting for sandbox to become active")
 	activeDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for r.now().Before(activeDeadline) {
 		if uiErr := checkForUIError(page); uiErr != "" {
-			return finalID, fmt.Errorf("sandbox active state error: %s", uiErr)
+			return fmt.Errorf("sandbox active state error: %s", uiErr)
 		}
 		activeBadge := page.Locator("section:has-text('Active'), span:has-text('Active'), td:has-text('Active'), div:has-text('Active')").First()
 		if count, _ := activeBadge.Count(); count > 0 {
 			if visible, _ := activeBadge.IsVisible(); visible {
-				log.Info().Str("sandbox_id", finalID).Msg("sandbox is Active")
-				return finalID, nil
+				log.Info().Str("sandbox_id", sandboxID).Msg("sandbox is Active")
+				return nil
 			}
 		}
 		time.Sleep(1 * time.Second)
 		_, _ = page.Evaluate("() => window.dispatchEvent(new Event('focus'))")
 	}
 
-	return finalID, fmt.Errorf("waiting for sandbox %s to become active timed out", finalID)
+	return fmt.Errorf("waiting for sandbox %s to become active timed out", sandboxID)
 }
 
 func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, timeout time.Duration) error {
@@ -1066,14 +1086,23 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 
 	// Wait for the delete dialog to close while checking for UI rejection toasts
 	dialogCloseDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	dialogClosed := false
 	for r.now().Before(dialogCloseDeadline) {
 		if uiErr := checkForUIError(page); uiErr != "" {
 			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
 		}
 		if hidden, _ := dialog.IsHidden(); hidden {
+			dialogClosed = true
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+
+	if !dialogClosed {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
+		}
+		return fmt.Errorf("delete confirmation dialog failed to close within %vms; deletion unconfirmed", timeoutMs)
 	}
 
 	// Wait for navigation away from the detail page back to the sandboxes dashboard
@@ -1085,6 +1114,24 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 			Timeout:   playwright.Float(timeoutMs),
 			WaitUntil: playwright.WaitUntilStateNetworkidle,
 		})
+	}
+
+	// Verify that the sandboxes list view is loaded before evaluating row absence as deletion proof
+	listLoadedDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	listLoaded := false
+	for r.now().Before(listLoadedDeadline) {
+		if uiErr := checkForUIError(page); uiErr != "" {
+			return fmt.Errorf("sandboxes list load failed: %s", uiErr)
+		}
+		listIndicator := page.Locator("table, div[role='rowgroup'], :has-text('No Sandboxes'), :has-text('No sandboxes match'), button:has-text('Create sandbox'), button:has-text('Create Sandbox')").First()
+		if isVisibleWithText(listIndicator) {
+			listLoaded = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !listLoaded {
+		return fmt.Errorf("sandboxes list failed to load after deletion")
 	}
 
 	// Poll until deleted sandbox is verified gone from the dashboard table
@@ -1162,12 +1209,17 @@ func isVisibleWithText(loc playwright.Locator) bool {
 
 func checkForUIError(page playwright.Page) string {
 	// 1. Explicit Sonner error toast
-	sonnerErr := page.Locator("[data-sonner-toast][data-type='error'], [data-sonner-toast]:has(.text-destructive)").First()
-	if isVisibleWithText(sonnerErr) {
-		if txt, err := sonnerErr.InnerText(); err == nil {
-			clean := strings.TrimSpace(txt)
-			if clean != "" && clean != "*" {
-				return clean
+	sonnerToasts := page.Locator("[data-sonner-toast][data-type='error'], [data-sonner-toast]:has(.text-destructive)")
+	if count, _ := sonnerToasts.Count(); count > 0 {
+		for i := 0; i < count; i++ {
+			toast := sonnerToasts.Nth(i)
+			if isVisibleWithText(toast) {
+				if txt, err := toast.InnerText(); err == nil {
+					clean := strings.TrimSpace(txt)
+					if clean != "" && clean != "*" {
+						return clean
+					}
+				}
 			}
 		}
 	}

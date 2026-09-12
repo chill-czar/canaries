@@ -26,7 +26,7 @@ variable "ui_canary_image" {
 variable "ui_scheduler_enabled" {
   description = "Whether the Cloud Scheduler job for UI canary is enabled"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "deployment_service_account_email" {

@@ -107,14 +107,11 @@ The UI canary is defined declaratively in Terraform under `infra/modules/ui_cana
 
 #### Safe Bootstrapping Sequence for New Targets
  
-For established deployments with provisioned Secret Manager versions, Cloud Scheduler is enabled by default (`ui_scheduler_enabled = true`). When onboarding a brand new target environment, disable the scheduler initially to prevent failure alerts prior to populating secrets:
+When onboarding a brand new target environment, the scheduler is disabled initially (`ui_scheduler_enabled = false`) to prevent automated executions and alerts prior to populating secrets:
  
-**Step 1: Apply Terraform with scheduler disabled (for fresh onboarding)**
-```bash
-cd infra/envs/staging/us-central1
-terraform apply -var="ui_scheduler_enabled=false"
-```
-This creates the Cloud Run Job, IAM roles, and empty Secret Manager containers without scheduling automated runs. (In CI, image variables `image`, `load_runner_image`, and `ui_canary_image` are passed automatically by the deploy workflow).
+**Step 1: Deploy infrastructure with scheduler disabled**
+
+On initial merge, CI applies Terraform with `ui_scheduler_enabled = false` (the default in `infra/envs/staging/us-central1/variables.tf`). This provisions the Cloud Run Job, IAM roles, and empty Secret Manager containers without activating the Cloud Scheduler job.
 
 **Step 2: Populate Secret Manager versions out-of-band**
 ```bash
@@ -122,15 +119,22 @@ PROJECT_ID="rayai-dev"
 echo -n "canary-operator@superserve.ai" | gcloud secrets versions add ui-canary-email-staging-us-central1 --project="$PROJECT_ID" --data-file=-
 echo -n "operator-password-here" | gcloud secrets versions add ui-canary-password-staging-us-central1 --project="$PROJECT_ID" --data-file=-
 echo -n "vercel-bypass-secret-here" | gcloud secrets versions add ui-canary-vercel-bypass-staging-us-central1 --project="$PROJECT_ID" --data-file=-
-# If this is a fresh target without existing API canary key:
+# If this is a fresh target without an existing API canary key:
 echo -n "superserve-api-key-here" | gcloud secrets versions add api-canary-key-staging-us-central1 --project="$PROJECT_ID" --data-file=-
 ```
 
-**Step 3: Enable the Cloud Scheduler job (default)**
+**Step 3: Manually execute and verify the Cloud Run Job**
 ```bash
-terraform apply
+gcloud run jobs execute ui-canary-staging-us-central1 \
+  --project rayai-dev \
+  --region us-central1 \
+  --wait
 ```
-(Or `-var="ui_scheduler_enabled=true"`). Normal CI deployments will henceforth maintain the scheduler as enabled.
+Inspect the execution logs to confirm authentication, sandbox creation, terminal execution, and cleanup succeeded.
+
+**Step 4: Enable the Cloud Scheduler job**
+
+Submit a follow-up commit updating `infra/envs/staging/us-central1/variables.tf` to set `default = true` for `ui_scheduler_enabled`. Once merged, normal CI deployments will henceforth maintain the scheduler as durably enabled.
 
 ## Target Inventory
 

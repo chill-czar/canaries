@@ -31,6 +31,11 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
+      - name: Install Playwright and Chromium
+        run: |
+          set -euo pipefail
+          go run github.com/playwright-community/playwright-go/cmd/playwright install --with-deps chromium
+
       - name: Go test
         run: |
           set -euo pipefail
@@ -131,6 +136,7 @@ jobs:
           plan_args=("-var=image=api-canary:pr-${GITHUB_SHA}")
           if [[ "${{ matrix.name }}" == "staging" ]]; then
             plan_args+=("-var=load_runner_image=api-canary:pr-${GITHUB_SHA}")
+            plan_args+=("-var=ui_canary_image=ui-canary:pr-${GITHUB_SHA}")
           fi
 
           set +e

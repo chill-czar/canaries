@@ -389,8 +389,9 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	}
 
 	// The Console chooses a region through its active team, independently of
-	// the Cloud Run job location. Never report a different region as healthy.
-	if prefix := r.Config.ExpectedSandboxIDPrefix; prefix != "" && !strings.HasPrefix(activeID, prefix) {
+	// the Cloud Run job location. Legacy UUIDs carry no region; they must pass
+	// ownership tagging against the configured regional API below.
+	if prefix := r.Config.ExpectedSandboxIDPrefix; !sandboxTargetCompatible(activeID, prefix, r.Tagger != nil) {
 		mp.RecordStep(ctx, env, region, target, scenario, "validate_target", "failure", 0)
 		captureArtifacts("validate_target")
 		res.Err = fmt.Errorf("created sandbox %s does not match target %s (expected ID prefix %s); check the canary account's active team", activeID, target, prefix)
@@ -1319,6 +1320,14 @@ func checkCreationError(tracker *sandboxIDTracker, page playwright.Page) error {
 		return fmt.Errorf("create sandbox validation error: %s", valErr)
 	}
 	return nil
+}
+
+func sandboxTargetCompatible(id, expectedPrefix string, hasRegionalTagger bool) bool {
+	if expectedPrefix == "" || strings.HasPrefix(id, expectedPrefix) {
+		return true
+	}
+	_, err := uuid.Parse(id)
+	return err == nil && hasRegionalTagger
 }
 
 // Multi-region logins must use the Console's own team switcher. A single-team

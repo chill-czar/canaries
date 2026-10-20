@@ -81,7 +81,7 @@ Per run it:
 | `CANARY_UI_EMAIL` | **Yes** | — | Canary operator login email |
 | `CANARY_UI_PASSWORD` | **Yes** | — | Canary operator login password |
 | `CANARY_UI_VERCEL_PROTECTION_BYPASS` | No | — | Vercel deployment protection bypass secret (injected via `x-vercel-protection-bypass` and `x-vercel-set-bypass-cookie: true` headers; never embed in `CANARY_UI_CONSOLE_URL`) |
-| `CANARY_UI_SANDBOX_ID_PREFIX` | No | — | Expected regional ID prefix (production west: `sb-usw-`, east: `sb-use-`); mismatches fail and trigger cleanup |
+| `CANARY_UI_SANDBOX_ID_PREFIX` | No | — | Expected regional ID prefix (production west: `sb-usw-`, east: `sb-use-`); legacy UUIDs require ownership tagging through the regional API |
 | `CANARY_UI_HEADLESS` | No | `true` | Run browser in headless mode (`true` or `false`) |
 | `CANARY_UI_STEP_TIMEOUT` | No | `45s` | Timeout for UI navigation and status assertion steps |
 | `CANARY_UI_TERMINAL_TIMEOUT` | No | `30s` | Timeout for terminal connection and command execution |
@@ -132,9 +132,9 @@ Each job has its own runtime identity, GCS lease, login secrets, and regional AP
 
 #### First deployment
 
-1. Deploy all roots with `ui_scheduler_enabled = false` (the committed bootstrap default). This creates the jobs, IAM bindings, and empty login secret containers without starting scheduled executions.
+1. Deploy all roots with `ui_scheduler_enabled = false` (the committed bootstrap default). This creates the jobs, IAM bindings, and empty login secret containers without starting scheduled executions. For pre-merge deployment, dispatch the Deploy workflow from a branch in `superserve-ai/canaries` with `scope=ui-only`; this uses the existing GitHub cloud identities and applies only the UI modules. Fork branches cannot obtain those cloud credentials.
 2. Populate `ui-canary-email-<target>` and `ui-canary-password-<target>` in the target project. Staging also requires `ui-canary-vercel-bypass-staging-us-central1`. Keep secret values out of Terraform and shell history; upload from a protected local file or through Secret Manager. The existing `api-canary-key-<target>` must belong to the **same team** as the UI login. Do not overwrite an existing API key merely to configure the UI canary.
-3. Use a dedicated login with billing enabled and permission to create sandboxes. For a multi-region login, the canary selects the unique team labeled `US East` or `US West` through the Console team switcher. Multiple matching teams fail before sandbox creation; a single-team login uses its default team. The Console selects its region from the active team, not from the Cloud Run location. Production jobs reject a sandbox ID from the wrong region and attempt UI cleanup instead of reporting that region healthy.
+3. Use a dedicated login with billing enabled and permission to create sandboxes. For a multi-region login, the canary selects the unique team labeled `US East` or `US West` through the Console team switcher. Multiple matching teams fail before sandbox creation; a single-team login uses its default team. The Console selects its region from the active team, not from the Cloud Run location. Production jobs reject a prefixed sandbox ID from the wrong region. Legacy UUIDs carry no region, so they must pass ownership tagging through the configured regional API; failures trigger UI cleanup.
 4. Run each job and inspect its result:
 
 ```bash

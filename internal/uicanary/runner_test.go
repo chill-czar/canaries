@@ -1350,3 +1350,23 @@ func TestSelectTargetTeam(t *testing.T) {
 		})
 	}
 }
+
+func TestSandboxTargetCompatibility(t *testing.T) {
+	const legacyID = "6c9599d0-c37f-4648-8229-e6b433972735"
+	for _, tc := range []struct {
+		name, id, prefix string
+		tagger, want     bool
+	}{
+		{"legacy UUID with regional verification", legacyID, "sb-use-", true, true},
+		{"legacy UUID cannot skip regional verification", legacyID, "sb-use-", false, false},
+		{"matching regional ID", "sb-usw-example", "sb-usw-", true, true},
+		{"wrong regional ID", "sb-use-example", "sb-usw-", true, false},
+		{"unknown ID format", "other-id", "sb-usw-", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sandboxTargetCompatible(tc.id, tc.prefix, tc.tagger); got != tc.want {
+				t.Fatalf("compatible = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

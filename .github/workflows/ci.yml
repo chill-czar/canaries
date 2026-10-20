@@ -8,12 +8,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    environment: staging
     permissions:
       contents: read
-      id-token: write
-    env:
-      TF_VAR_deployment_service_account_email: ${{ vars.GCP_SERVICE_ACCOUNT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +20,6 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - uses: actions/setup-node@v4
         with:
@@ -103,7 +93,9 @@ jobs:
         run: gitleaks git --redact --verbose
 
   terraform-plan:
-    if: github.event_name == 'pull_request'
+    # Forks cannot obtain GitHub OIDC tokens. Their browser/build/validate checks
+    # still run above; an operator must review a live-state plan before merge.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: ${{ matrix.environment }}
     permissions:

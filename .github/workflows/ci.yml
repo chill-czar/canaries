@@ -14,7 +14,6 @@ jobs:
       id-token: write
     env:
       TF_VAR_deployment_service_account_email: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      PLAYWRIGHT_DRIVER_PATH: ${{ runner.temp }}/playwright-driver
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +38,8 @@ jobs:
       - name: Install Playwright and Chromium
         run: |
           set -euo pipefail
+          export PLAYWRIGHT_DRIVER_PATH="$RUNNER_TEMP/playwright-driver"
+          echo "PLAYWRIGHT_DRIVER_PATH=$PLAYWRIGHT_DRIVER_PATH" >> "$GITHUB_ENV"
           mkdir -p "$PLAYWRIGHT_DRIVER_PATH"
           npm pack playwright-core@1.57.0 --pack-destination "$PLAYWRIGHT_DRIVER_PATH" --silent
           tar -xzf "$PLAYWRIGHT_DRIVER_PATH/playwright-core-1.57.0.tgz" -C "$PLAYWRIGHT_DRIVER_PATH"

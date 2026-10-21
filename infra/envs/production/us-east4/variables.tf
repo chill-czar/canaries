@@ -34,6 +34,6 @@ variable "ui_canary_image" {
 
 variable "ui_scheduler_enabled" {
   type        = bool
-  default     = false
+  default     = true
   description = "Enable the five-minute UI schedule after credentials and a manual run are verified"
 }

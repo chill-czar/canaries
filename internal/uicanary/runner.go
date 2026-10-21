@@ -111,6 +111,9 @@ func (r Runner) metricsProvider() metrics.Provider {
 }
 
 func (r Runner) Run(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	runTimeout := r.Config.BaseConfig.RunTimeout
 	if runTimeout <= 0 {
 		runTimeout = 5 * time.Minute
@@ -163,6 +166,9 @@ func (r Runner) Run(ctx context.Context) error {
 
 	res := r.runLifecycle(ctx, runID)
 	err := res.Err
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err == nil {
 		result = "success"
 	}
@@ -210,6 +216,17 @@ func resolveTargetTuple(baseCfg config.Config) (target, env, region string) {
 }
 
 func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) {
+	if err := ctx.Err(); err != nil {
+		return RunResult{Err: err, FailedStep: "cancelled"}
+	}
+	defer func() {
+		if err := ctx.Err(); err != nil {
+			res.Err = err
+			if res.FailedStep == "" {
+				res.FailedStep = "cancelled"
+			}
+		}
+	}()
 	mp := r.metricsProvider()
 	target, env, region := resolveTargetTuple(r.Config.BaseConfig)
 	scenario := "ui-lifecycle"
@@ -231,6 +248,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(r.Config.Headless),
+		Timeout:  playwright.Float(browserTimeoutMs(ctx, float64(r.Config.StepTimeout.Milliseconds()))),
 	})
 	if err != nil {
 		res.Err = fmt.Errorf("launch chromium: %w", err)
@@ -283,9 +301,16 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		return res
 	}
 	defer page.Close()
+	stopPageCancellation := closePageOnCancellation(ctx, page)
+	defer stopPageCancellation()
+	page.SetDefaultTimeout(browserTimeoutMs(ctx, float64(r.Config.StepTimeout.Milliseconds())))
+	page.SetDefaultNavigationTimeout(browserTimeoutMs(ctx, float64(r.Config.StepTimeout.Milliseconds())))
 
 	// Diagnostic artifact capture helper
 	captureArtifacts := func(stepName string) {
+		if ctx.Err() != nil {
+			return
+		}
 		if r.Config.ArtifactsDir == "" {
 			return
 		}
@@ -302,6 +327,9 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	}
 
 	stepTimeout := r.Config.StepTimeout
+	if stepTimeout <= 0 {
+		stepTimeout = 45 * time.Second
+	}
 	stepTimeoutMs := float64(stepTimeout.Milliseconds())
 
 	var (
@@ -328,6 +356,21 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		sandboxDeleted = true
 	}
 
+	cleanupSandbox := func(id, name string) error {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), stepTimeout)
+		defer cancel()
+		cleanupPage, err := bCtx.NewPage()
+		if err != nil {
+			return fmt.Errorf("open cleanup page: %w", err)
+		}
+		defer cleanupPage.Close()
+		stopCleanupCancellation := closePageOnCancellation(cleanupCtx, cleanupPage)
+		defer stopCleanupCancellation()
+		cleanupPage.SetDefaultTimeout(stepTimeoutMs)
+		cleanupPage.SetDefaultNavigationTimeout(stepTimeoutMs)
+		return r.deleteSandboxInUI(cleanupCtx, cleanupPage, id, name, stepTimeoutMs)
+	}
+
 	// Guaranteed deferred cleanup if sandbox was created but not successfully deleted
 	defer func() {
 		cleanupMu.Lock()
@@ -338,7 +381,11 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 
 		if idToClean != "" && !isDel {
 			log.Info().Str("sandbox_id", idToClean).Str("sandbox_name", nameToClean).Msg("executing deferred sandbox cleanup on failure/exit")
-			_ = r.deleteSandboxInUI(page, idToClean, nameToClean, stepTimeoutMs)
+			if err := cleanupSandbox(idToClean, nameToClean); err != nil {
+				log.Error().Err(err).Str("sandbox_id", idToClean).Msg("deferred UI cleanup failed; sandbox may require janitor recovery")
+			} else {
+				log.Info().Str("sandbox_id", idToClean).Msg("deferred UI cleanup completed")
+			}
 		}
 	}()
 
@@ -355,7 +402,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	mp.RecordStep(ctx, env, region, target, scenario, "authenticate", "success", r.now().Sub(authStart))
 
 	// Step 2: Create Sandbox
-	if err := selectTargetTeam(page, r.Config, stepTimeoutMs); err != nil {
+	if err := selectTargetTeam(ctx, page, r.Config, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "select_team", "failure", 0)
 		captureArtifacts("select_team")
 		res.Err = fmt.Errorf("select target team: %w", err)
@@ -370,7 +417,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	createdSandboxName = sandboxName
 	cleanupMu.Unlock()
 
-	sbID, err := r.createSandboxInUI(page, sandboxName, stepTimeoutMs, func(id string) {
+	sbID, err := r.createSandboxInUI(ctx, page, sandboxName, stepTimeoutMs, func(id string) {
 		setCreatedID(id)
 	})
 	activeID := getCreatedID()
@@ -436,7 +483,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 			captureArtifacts("tag_sandbox")
 
 			// Synchronously delete the unowned sandbox immediately
-			if delErr := r.deleteSandboxInUI(page, activeID, sandboxName, stepTimeoutMs); delErr == nil {
+			if delErr := cleanupSandbox(activeID, sandboxName); delErr == nil {
 				markDeleted()
 			} else {
 				log.Error().Err(delErr).Str("sandbox_id", activeID).Msg("failed synchronous deletion of unowned sandbox after tag failure")
@@ -452,7 +499,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 2b: Wait for UI readiness (dismiss connect modal, navigate to detail, wait for Active)
 	// Runs only after durable ownership tagging has completed.
 	readyStart := r.now()
-	if err := r.waitForSandboxReadyInUI(page, activeID, stepTimeoutMs); err != nil {
+	if err := r.waitForSandboxReadyInUI(ctx, page, activeID, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "create_sandbox", "failure", r.now().Sub(createStart))
 		captureArtifacts("create_sandbox")
 		res.Err = fmt.Errorf("sandbox UI readiness: %w", err)
@@ -465,7 +512,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 3: Interactive Terminal Execution
 	termStart := r.now()
 	log.Info().Msg("UI step: terminal_exec")
-	if err := r.executeTerminalCommand(page, activeID, r.Config.TerminalTimeout); err != nil {
+	if err := r.executeTerminalCommand(ctx, page, activeID, r.Config.TerminalTimeout); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "terminal_exec", "failure", r.now().Sub(termStart))
 		captureArtifacts("terminal_exec")
 		res.Err = fmt.Errorf("terminal execution: %w", err)
@@ -477,7 +524,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 4: Pause Sandbox
 	pauseStart := r.now()
 	log.Info().Msg("UI step: pause_sandbox")
-	if err := r.pauseSandboxInUI(page, activeID, stepTimeoutMs); err != nil {
+	if err := r.pauseSandboxInUI(ctx, page, activeID, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "pause_sandbox", "failure", r.now().Sub(pauseStart))
 		captureArtifacts("pause_sandbox")
 		res.Err = fmt.Errorf("pause sandbox: %w", err)
@@ -489,7 +536,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 5: Resume Sandbox
 	resumeStart := r.now()
 	log.Info().Msg("UI step: resume_sandbox")
-	if err := r.resumeSandboxInUI(page, activeID, stepTimeoutMs); err != nil {
+	if err := r.resumeSandboxInUI(ctx, page, activeID, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "resume_sandbox", "failure", r.now().Sub(resumeStart))
 		captureArtifacts("resume_sandbox")
 		res.Err = fmt.Errorf("resume sandbox: %w", err)
@@ -501,7 +548,7 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	// Step 6: Delete Sandbox
 	deleteStart := r.now()
 	log.Info().Msg("UI step: delete_sandbox")
-	if err := r.deleteSandboxInUI(page, activeID, sandboxName, stepTimeoutMs); err != nil {
+	if err := r.deleteSandboxInUI(ctx, page, activeID, sandboxName, stepTimeoutMs); err != nil {
 		mp.RecordStep(ctx, env, region, target, scenario, "delete_sandbox", "failure", r.now().Sub(deleteStart))
 		captureArtifacts("delete_sandbox")
 		res.Err = fmt.Errorf("delete sandbox: %w", err)
@@ -514,7 +561,12 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	return res
 }
 
-func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, timeoutMs float64, onIDDiscovered func(string)) (string, error) {
+func (r Runner) createSandboxInUI(ctx context.Context, page playwright.Page, sandboxName string, timeoutMs float64, onIDDiscovered func(string)) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	// Navigate to sandboxes list if not already there
 	parsedURL, _ := url.Parse(page.URL())
 	cleanPath := ""
@@ -577,7 +629,9 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		}
 		_ = nameInput.Click()
 		_ = nameInput.Fill(sandboxName)
-		time.Sleep(200 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 200*time.Millisecond); err != nil {
+			return "", err
+		}
 	}
 
 	tracker := newSandboxIDTracker(func(id string) {
@@ -688,7 +742,9 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 		row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName)).First()
 		if count, _ := row.Count(); count > 0 {
 			_ = row.Click()
-			time.Sleep(500 * time.Millisecond)
+			if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+				return "", err
+			}
 			if id := extractSandboxIDFromURL(page.URL()); id != "" {
 				tracker.Set(id)
 				return tracker.Get(), nil
@@ -699,7 +755,11 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			return id, nil
 		}
 
-		time.Sleep(200 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 200*time.Millisecond); err != nil {
+
+			return "", err
+
+		}
 	}
 
 	// 5. Fallback: navigate directly to sandboxes list and find row only if no backend/UI errors
@@ -713,11 +773,15 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 			Timeout:   playwright.Float(timeoutMs),
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 		})
-		time.Sleep(1 * time.Second)
+		if err := waitForBrowserPoll(ctx, 1*time.Second); err != nil {
+			return "", err
+		}
 		row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName)).First()
 		if count, _ := row.Count(); count > 0 {
 			_ = row.Click()
-			time.Sleep(500 * time.Millisecond)
+			if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+				return "", err
+			}
 			if id := extractSandboxIDFromURL(page.URL()); id != "" {
 				tracker.Set(id)
 			}
@@ -735,7 +799,12 @@ func (r Runner) createSandboxInUI(page playwright.Page, sandboxName string, time
 	return finalID, nil
 }
 
-func (r Runner) waitForSandboxReadyInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {
+func (r Runner) waitForSandboxReadyInUI(ctx context.Context, page playwright.Page, sandboxID string, timeoutMs float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	// 1. Dismiss ConnectSandboxDialog actions if still visible
 	openTerminalBtn := page.Locator("div[role='dialog'] button:has-text('Open Terminal'), .dialog-popup button:has-text('Open Terminal'), button:has-text('Open Terminal')").First()
 	doneBtn := page.Locator("div[role='dialog'] button:has-text('Done'), .dialog-popup button:has-text('Done'), button:has-text('Done')").First()
@@ -778,15 +847,22 @@ func (r Runner) waitForSandboxReadyInUI(page playwright.Page, sandboxID string, 
 				return nil
 			}
 		}
-		time.Sleep(1 * time.Second)
+		if err := waitForBrowserPoll(ctx, 1*time.Second); err != nil {
+			return err
+		}
 		_, _ = page.Evaluate("() => window.dispatchEvent(new Event('focus'))")
 	}
 
 	return fmt.Errorf("waiting for sandbox %s to become active timed out", sandboxID)
 }
 
-func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, timeout time.Duration) error {
-	timeoutMs := float64(timeout.Milliseconds())
+func (r Runner) executeTerminalCommand(ctx context.Context, page playwright.Page, sandboxID string, timeout time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs := browserTimeoutMs(ctx, float64(timeout.Milliseconds()))
+	timeout = time.Duration(timeoutMs) * time.Millisecond
+	page.SetDefaultTimeout(timeoutMs)
 
 	// Navigate to terminal page if not already there
 	terminalURL := fmt.Sprintf("%s/sandboxes/%s/terminal/", r.Config.ConsoleURL, sandboxID)
@@ -882,7 +958,9 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 			promptReady = true
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	if !promptReady {
@@ -905,7 +983,9 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 	}
 
 	focusTerminal()
-	time.Sleep(500 * time.Millisecond)
+	if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+		return err
+	}
 
 	// Generate arithmetic transformation operands so typed keystrokes cannot false-positive match the evaluated output
 	cmd, expectedOutput := generateTerminalCommand()
@@ -916,7 +996,9 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 		if err := page.Keyboard().Type(cmd, playwright.KeyboardTypeOptions{Delay: playwright.Float(30)}); err != nil {
 			return fmt.Errorf("type command to terminal: %w", err)
 		}
-		time.Sleep(300 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 300*time.Millisecond); err != nil {
+			return err
+		}
 		if err := page.Keyboard().Press("Enter"); err != nil {
 			return fmt.Errorf("press Enter in terminal: %w", err)
 		}
@@ -943,13 +1025,22 @@ func (r Runner) executeTerminalCommand(page playwright.Page, sandboxID string, t
 			lastRetry = r.now()
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+
+			return err
+
+		}
 	}
 
 	return fmt.Errorf("terminal output did not contain expected transformed sentinel %q within timeout", expectedOutput)
 }
 
-func (r Runner) pauseSandboxInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {
+func (r Runner) pauseSandboxInUI(ctx context.Context, page playwright.Page, sandboxID string, timeoutMs float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, sandboxID)
 	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, sandboxID)) || strings.Contains(page.URL(), "/terminal") {
 		if _, err := page.Goto(detailURL, playwright.PageGotoOptions{
@@ -984,13 +1075,20 @@ func (r Runner) pauseSandboxInUI(page playwright.Page, sandboxID string, timeout
 				return nil
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	return fmt.Errorf("waiting for Paused status timed out")
 }
 
-func (r Runner) resumeSandboxInUI(page playwright.Page, sandboxID string, timeoutMs float64) error {
+func (r Runner) resumeSandboxInUI(ctx context.Context, page playwright.Page, sandboxID string, timeoutMs float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, sandboxID)
 	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, sandboxID)) || strings.Contains(page.URL(), "/terminal") {
 		if _, err := page.Goto(detailURL, playwright.PageGotoOptions{
@@ -1025,13 +1123,20 @@ func (r Runner) resumeSandboxInUI(page playwright.Page, sandboxID string, timeou
 				return nil
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	return fmt.Errorf("waiting for Active status after resume timed out")
 }
 
-func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName string, timeoutMs float64) error {
+func (r Runner) deleteSandboxInUI(ctx context.Context, page playwright.Page, sandboxID, sandboxName string, timeoutMs float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	detailURL := fmt.Sprintf("%s/sandboxes/%s/", r.Config.ConsoleURL, sandboxID)
 	if !strings.HasPrefix(page.URL(), fmt.Sprintf("%s/sandboxes/%s", r.Config.ConsoleURL, sandboxID)) || strings.Contains(page.URL(), "/terminal") {
 		if _, err := page.Goto(detailURL, playwright.PageGotoOptions{
@@ -1041,6 +1146,30 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 			return fmt.Errorf("navigate to sandbox detail for deletion: %w", err)
 		}
 	}
+
+	// Observe the UI's own deletion request; a closed dialog or optimistic list
+	// update alone does not prove that the backend accepted the deletion.
+	consoleURL, err := url.Parse(r.Config.ConsoleURL)
+	if err != nil {
+		return fmt.Errorf("parse console URL: %w", err)
+	}
+	var deleteMu sync.Mutex
+	deleteStatus := 0
+	responseHandler := func(res playwright.Response) {
+		u, err := url.Parse(res.URL())
+		if err != nil || u.Scheme != consoleURL.Scheme || u.Host != consoleURL.Host || res.Request().Method() != "DELETE" {
+			return
+		}
+		path := strings.TrimRight(u.Path, "/")
+		if path != "/api/sandboxes/"+sandboxID && path != "/sandboxes/"+sandboxID {
+			return
+		}
+		deleteMu.Lock()
+		deleteStatus = res.Status()
+		deleteMu.Unlock()
+	}
+	page.OnResponse(responseHandler)
+	defer page.RemoveListener("response", responseHandler)
 
 	// Open More actions menu
 	menuTrigger := page.Locator("button[aria-label='More actions']").First()
@@ -1110,7 +1239,9 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 		}
 		// Fallback re-fill if React state didn't pick up typing
 		_ = confirmInput.Fill(sandboxName)
-		time.Sleep(300 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 300*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	if !clicked {
@@ -1128,7 +1259,9 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 			dialogClosed = true
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 200*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	if !dialogClosed {
@@ -1138,51 +1271,68 @@ func (r Runner) deleteSandboxInUI(page playwright.Page, sandboxID, sandboxName s
 		return fmt.Errorf("delete confirmation dialog failed to close within %vms; deletion unconfirmed", timeoutMs)
 	}
 
-	// Wait for navigation away from the detail page back to the sandboxes dashboard
-	listURL := fmt.Sprintf("%s/sandboxes/", r.Config.ConsoleURL)
-	if err := page.WaitForURL(listURL+"**", playwright.PageWaitForURLOptions{
-		Timeout: playwright.Float(timeoutMs),
-	}); err != nil {
-		_, _ = page.Goto(listURL, playwright.PageGotoOptions{
-			Timeout:   playwright.Float(timeoutMs),
-			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
-		})
-	}
-
-	// Verify that the sandboxes list view is loaded before evaluating row absence as deletion proof
-	listLoadedDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	listLoaded := false
-	for r.now().Before(listLoadedDeadline) {
+	// Require the actual list route and rendered data, not detail-page tables,
+	// loading shells, or create buttons. Never force navigation to hide a failed
+	// post-delete transition.
+	deadline = r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	confirmedResponse, onList, listLoaded := false, false, false
+	for r.now().Before(deadline) {
 		if uiErr := checkForUIError(page); uiErr != "" {
-			return fmt.Errorf("sandboxes list load failed: %s", uiErr)
+			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
 		}
-		listIndicator := page.Locator("table, div[role='rowgroup'], :has-text('No Sandboxes'), :has-text('No sandboxes match'), button:has-text('Create sandbox'), button:has-text('Create Sandbox')").First()
-		if isVisibleWithText(listIndicator) {
-			listLoaded = true
-			break
+		deleteMu.Lock()
+		status := deleteStatus
+		deleteMu.Unlock()
+		if status >= 400 {
+			return fmt.Errorf("delete sandbox rejected: HTTP %d", status)
 		}
-		time.Sleep(200 * time.Millisecond)
+		confirmedResponse = status >= 200 && status < 300
+		currentURL, err := url.Parse(page.URL())
+		onList = err == nil && currentURL.Scheme == consoleURL.Scheme && currentURL.Host == consoleURL.Host && strings.TrimRight(currentURL.Path, "/") == "/sandboxes"
+		listLoaded = onList && isSandboxListLoaded(page)
+		if confirmedResponse && listLoaded {
+			row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName))
+			count, err := row.Count()
+			if err != nil {
+				return fmt.Errorf("inspect sandbox list after deletion: %w", err)
+			}
+			if count == 0 {
+				return nil
+			}
+		}
+		if err := waitForBrowserPoll(ctx, 200*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	if !confirmedResponse {
+		return fmt.Errorf("no successful UI delete response for sandbox %s; deletion unconfirmed", sandboxID)
+	}
+	if !onList {
+		return fmt.Errorf("UI did not navigate to the sandboxes list after deletion")
 	}
 	if !listLoaded {
 		return fmt.Errorf("sandboxes list failed to load after deletion")
 	}
-
-	// Poll until deleted sandbox is verified gone from the dashboard table
-	time.Sleep(1 * time.Second)
-	pollDeadline := r.now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	for r.now().Before(pollDeadline) {
-		if uiErr := checkForUIError(page); uiErr != "" {
-			return fmt.Errorf("delete sandbox rejected: %s", uiErr)
-		}
-		row := page.Locator(fmt.Sprintf("tr:has-text('%s'), div[role='row']:has-text('%s')", sandboxName, sandboxName)).First()
-		count, _ := row.Count()
-		if count == 0 {
-			return nil
-		}
-		time.Sleep(1 * time.Second)
-	}
-
 	return fmt.Errorf("sandbox %s still present in table after deletion", sandboxName)
+}
+
+func isSandboxListLoaded(page playwright.Page) bool {
+	// These are the Console's resolved empty state or selectable sandbox rows.
+	// A table header/skeleton without data is not a loaded list.
+	empty := page.Locator("p:text-is('No Sandboxes'), p:text-is('No sandboxes match')")
+	rows := page.Locator("table:has(th:has-text('Name')):has(th:has-text('Status')) tbody tr:has([aria-label^='Select '])")
+	for _, loc := range []playwright.Locator{empty, rows} {
+		count, err := loc.Count()
+		if err != nil {
+			continue
+		}
+		for i := 0; i < count; i++ {
+			if visible, err := loc.Nth(i).IsVisible(); err == nil && visible {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractSandboxIDFromURL(rawURL string) string {
@@ -1332,7 +1482,12 @@ func sandboxTargetCompatible(id, expectedPrefix string, hasRegionalTagger bool) 
 
 // An explicit label requires the Console's team switcher. Without one, retain
 // regional selection and single-team behavior; API tagging verifies ownership.
-func selectTargetTeam(page playwright.Page, cfg Config, timeoutMs float64) error {
+func selectTargetTeam(ctx context.Context, page playwright.Page, cfg Config, timeoutMs float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timeoutMs = browserTimeoutMs(ctx, timeoutMs)
+	page.SetDefaultTimeout(timeoutMs)
 	regionLabel := map[string]string{"sb-use-": "US East", "sb-usw-": "US West"}[cfg.ExpectedSandboxIDPrefix]
 	if regionLabel == "" && cfg.TeamLabel == "" {
 		return nil
@@ -1385,7 +1540,51 @@ func selectTargetTeam(page playwright.Page, cfg Config, timeoutMs float64) error
 		if strings.TrimSpace(selected) == strings.TrimSpace(text) && !disabled {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
 	}
 	return fmt.Errorf("Console did not confirm active team %q", strings.TrimSpace(text))
+}
+
+// Closing a cancelled page interrupts Playwright calls that have no Go context
+// parameter. Cleanup uses another page in the same authenticated browser context.
+func closePageOnCancellation(ctx context.Context, page playwright.Page) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		_ = page.Close()
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
+func browserTimeoutMs(ctx context.Context, timeoutMs float64) float64 {
+	if timeoutMs <= 0 {
+		timeoutMs = 45000
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		timeLeft := float64(time.Until(deadline).Milliseconds())
+		if timeLeft < timeoutMs {
+			timeoutMs = timeLeft
+		}
+	}
+	if timeoutMs < 1 {
+		return 1 // Playwright treats zero as an unlimited timeout.
+	}
+	return timeoutMs
+}
+
+func waitForBrowserPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }

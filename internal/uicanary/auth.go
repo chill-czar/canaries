@@ -13,11 +13,15 @@ import (
 
 // Authenticate executes the email & password sign-in flow on the Superserve console.
 func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	log.Info().Str("email", maskEmail(cfg.Email)).Msg("authenticating UI canary via email/password form")
 
 	baseURL := strings.TrimRight(cfg.ConsoleURL, "/")
 	rootURL := baseURL + "/"
-	timeoutMs := float64(cfg.StepTimeout.Milliseconds())
+	timeoutMs := browserTimeoutMs(ctx, float64(cfg.StepTimeout.Milliseconds()))
+	page.SetDefaultTimeout(timeoutMs)
 
 	if _, err := page.Goto(rootURL, playwright.PageGotoOptions{
 		Timeout:   playwright.Float(timeoutMs),
@@ -80,7 +84,9 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 			}
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		if err := waitForBrowserPoll(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
 	}
 
 	if currentURL, err := url.Parse(page.URL()); err == nil {

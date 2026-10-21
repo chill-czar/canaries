@@ -2,6 +2,7 @@ package uicanary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,7 @@ type mockServerState struct {
 	rejectPause                bool
 	rejectResume               bool
 	rejectDelete               bool
+	hangDelete                 bool
 	rejectCreation             bool
 	initialStatus              string
 	externalURL                string
@@ -130,13 +132,6 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 	})
 
 	mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("deleted") == "true" {
-			if state != nil {
-				state.Lock()
-				state.deletedSandbox = true
-				state.Unlock()
-			}
-		}
 		w.Header().Set("Content-Type", "text/html")
 		reject := false
 		if state != nil {
@@ -156,7 +151,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 <body>
   <h1>Sandboxes</h1>
   <button id="create-btn" onclick="document.getElementById('dialog').style.display='block'">Create sandbox</button>
-  <table id="sandboxes-table"><tbody><tr><td>Ready</td></tr></tbody></table>
+  <table id="sandboxes-table"><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody><tr><td><input type="checkbox" aria-label="Select other-sandbox" />other-sandbox</td><td>Active</td></tr></tbody></table>
 
   <div id="dialog" role="dialog" style="display:none;">
     <input type="text" placeholder="my-sandbox" id="name-input" />
@@ -174,6 +169,24 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
   </div>
 </body>
 </html>`, submitAction)
+	})
+
+	mux.HandleFunc("/api/sandboxes/sb-mock-123", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if state != nil {
+			state.Lock()
+			if state.hangDelete {
+				state.Unlock()
+				<-r.Context().Done()
+				return
+			}
+			state.deletedSandbox = true
+			state.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("/api/sandboxes", func(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +218,7 @@ func setupMockConsoleServer(opts ...*mockServerState) *httptest.Server {
 			startAction = `fetch('/resume-sandbox', {method: 'POST'}).catch(function(){}); document.getElementById('resume-err-toast').style.display='block';`
 		}
 
-		deleteAction := `window.location.href='/sandboxes/?deleted=true'`
+		deleteAction := `fetch('/api/sandboxes/sb-mock-123', {method: 'DELETE'}).then(() => { window.location.href='/sandboxes/'; });`
 		if rejectDelete {
 			deleteAction = `document.getElementById('delete-err-toast').style.display='block';`
 		}
@@ -1197,7 +1210,7 @@ func TestResumeIgnoresTableActiveCell(t *testing.T) {
 
 	// 1 second timeout.
 	// If locator matched td:has-text('Active'), resumeSandboxInUI would immediately return nil.
-	err = runner.resumeSandboxInUI(page, "sb-test-table", 1000)
+	err = runner.resumeSandboxInUI(context.Background(), page, "sb-test-table", 1000)
 	if err == nil {
 		t.Fatal("expected resumeSandboxInUI to time out ignoring td:has-text('Active'); got nil")
 	}
@@ -1320,7 +1333,7 @@ func TestSelectTargetTeam(t *testing.T) {
 		if err := page.SetContent(`<h1>Sandboxes</h1>`); err != nil {
 			t.Fatal(err)
 		}
-		if err := selectTargetTeam(page, Config{TeamLabel: "shared"}, 100); err == nil {
+		if err := selectTargetTeam(context.Background(), page, Config{TeamLabel: "shared"}, 100); err == nil {
 			t.Fatal("missing switcher silently accepted the default team")
 		}
 	})
@@ -1346,7 +1359,7 @@ func TestSelectTargetTeam(t *testing.T) {
 			if err := page.SetContent(`<button role="combobox" aria-label="Active team" onclick="document.querySelector('[role=listbox]').hidden=false">default team</button><div role="listbox" hidden>` + tc.options + `</div><script>document.querySelectorAll('[role=option]').forEach(o=>o.onclick=()=>{document.querySelector('button').textContent=o.textContent;document.querySelector('[role=listbox]').hidden=true})</script>`); err != nil {
 				t.Fatal(err)
 			}
-			err = selectTargetTeam(page, Config{ExpectedSandboxIDPrefix: tc.prefix, TeamLabel: tc.label}, 1000)
+			err = selectTargetTeam(context.Background(), page, Config{ExpectedSandboxIDPrefix: tc.prefix, TeamLabel: tc.label}, 1000)
 			if tc.fail {
 				if err == nil {
 					t.Fatal("expected team selection failure")
@@ -1383,6 +1396,149 @@ func TestSandboxTargetCompatibility(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := sandboxTargetCompatible(tc.id, tc.prefix, tc.tagger); got != tc.want {
 				t.Fatalf("compatible = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeleteRequiresResponseNavigationAndLoadedList(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+	pw, err := playwright.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pw.Stop()
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Headless: playwright.Bool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+
+	loadedTable := `<table><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody><tr><td><input type="checkbox" aria-label="Select other" />other</td><td>Active</td></tr></tbody></table>`
+	for _, tc := range []struct {
+		name, action, list, wantError string
+		status                        int
+	}{
+		{"detail page with unrelated table", "stay", loadedTable, "did not navigate", 204},
+		{"loading with create button", "delete", `<button>Create sandbox</button><p>Loading...</p>`, "list failed to load", 204},
+		{"empty table shell", "delete", `<table><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody></tbody></table>`, "list failed to load", 204},
+		{"delayed still-existing row", "delete", fmt.Sprintf(`<button>Create sandbox</button><div id="results"></div><script>setTimeout(() => {document.getElementById("results").innerHTML=%q}, 4000)</script>`, strings.ReplaceAll(loadedTable, "other", "ui-canary-test")), "still present", 204},
+		{"hidden empty state", "delete", `<p style="display:none">No Sandboxes</p><button>Create sandbox</button>`, "list failed to load", 204},
+		{"sandbox remains", "delete", strings.ReplaceAll(loadedTable, "other", "ui-canary-test"), "still present", 204},
+		{"no delete request", "none", `<p>No Sandboxes</p>`, "no successful UI delete response", 204},
+		{"different sandbox response", "wrong-id", `<p>No Sandboxes</p>`, "no successful UI delete response", 204},
+		{"rejected delete hides dialog", "delete", `<p>No Sandboxes</p>`, "HTTP 500", 500},
+		{"loaded nonempty list", "delete", loadedTable, "", 204},
+		{"resolved empty list", "delete", `<p>No Sandboxes</p>`, "", 204},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete {
+					t.Errorf("unexpected method %s", r.Method)
+				}
+				w.WriteHeader(tc.status)
+			})
+			mux.HandleFunc("/sandboxes/", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				if r.URL.Path == "/sandboxes/" {
+					fmt.Fprint(w, "<html><body><h1>Sandboxes</h1>"+tc.list+"</body></html>")
+					return
+				}
+				action := `fetch('/api/sandboxes/sb-delete-test', {method:'DELETE'}).then(() => { document.getElementById('delete-dialog').style.display='none'; window.location.href='/sandboxes/'; })`
+				switch tc.action {
+				case "stay":
+					action = strings.ReplaceAll(action, "window.location.href='/sandboxes/';", "")
+				case "none":
+					action = `document.getElementById('delete-dialog').style.display='none'; window.location.href='/sandboxes/';`
+				case "wrong-id":
+					action = strings.ReplaceAll(action, "/api/sandboxes/sb-delete-test", "/api/sandboxes/other")
+				}
+				fmt.Fprintf(w, `<html><body><h1>ui-canary-test</h1>%s
+<button aria-label="More actions" onclick="document.getElementById('menu').style.display='block'">More actions</button>
+<div id="menu" style="display:none"><div role="menuitem" onclick="document.getElementById('delete-dialog').style.display='block'">Delete sandbox</div></div>
+<div role="dialog" id="delete-dialog" style="display:none"><input /><button onclick="%s">Delete</button></div>
+</body></html>`, loadedTable, action)
+			})
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			page, err := browser.NewPage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer page.Close()
+			runner := Runner{Config: Config{ConsoleURL: server.URL}, Clock: time.Now}
+			timeoutMs := 700.0
+			if tc.name == "delayed still-existing row" {
+				timeoutMs = 4500
+			}
+			err = runner.deleteSandboxInUI(context.Background(), page, "sb-delete-test", "ui-canary-test", timeoutMs)
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("expected confirmed deletion, got %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("expected %q, got %v", tc.wantError, err)
+			}
+		})
+	}
+}
+
+func TestLifecycleCancellationStopsWorkAndBoundsCleanup(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+	for _, tc := range []struct {
+		name       string
+		deadline   bool
+		hangDelete bool
+	}{
+		{name: "cancel after tagging"},
+		{name: "deadline during terminal poll", deadline: true},
+		{name: "cancel with stalled cleanup", hangDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &mockServerState{failTerminal: tc.deadline, hangDelete: tc.hangDelete}
+			server := setupMockConsoleServer(state)
+			defer server.Close()
+			cfg := newMockRunnerConfig(server.URL, "")
+			cfg.StepTimeout = 2 * time.Second
+			cfg.TerminalTimeout = 30 * time.Second
+			if tc.deadline {
+				cfg.BaseConfig.RunTimeout = 5 * time.Second
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tagged := false
+			runner := Runner{Config: cfg, Clock: time.Now, Tagger: &mockSandboxTagger{
+				tagFn: func(context.Context, string, map[string]string) error {
+					tagged = true
+					if !tc.deadline {
+						cancel()
+					}
+					return nil
+				},
+			}}
+			started := time.Now()
+			err := runner.Run(ctx)
+			want := context.Canceled
+			if tc.deadline {
+				want = context.DeadlineExceeded
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("expected %v, got %v", want, err)
+			}
+			if !tagged {
+				t.Fatal("test never reached successful ownership tagging")
+			}
+			if elapsed := time.Since(started); elapsed > 9*time.Second {
+				t.Fatalf("cancellation/cleanup exceeded its bound: %s", elapsed)
+			}
+			state.Lock()
+			defer state.Unlock()
+			if state.pausedSandbox || state.resumedSandbox || (!tc.deadline && state.terminalCommandExecuted) {
+				t.Fatal("continued lifecycle work after cancellation")
+			}
+			if state.deletedSandbox == tc.hangDelete {
+				t.Fatalf("cleanup deleted=%v with stalled delete=%v", state.deletedSandbox, tc.hangDelete)
 			}
 		})
 	}

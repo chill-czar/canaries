@@ -57,23 +57,26 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 	parsedBase, pErr := url.Parse(baseURL)
 	deadline := time.Now().Add(cfg.StepTimeout)
 	for time.Now().Before(deadline) {
-		// Check if an error message is visible
-		errorLoc := page.Locator(".text-destructive, [role='alert']")
-		if count, _ := errorLoc.Count(); count > 0 {
-			if visible, _ := errorLoc.First().IsVisible(); visible {
-				errMsg, _ := errorLoc.First().InnerText()
-				errMsg = strings.TrimSpace(errMsg)
-				if errMsg != "" {
-					return fmt.Errorf("sign in failed with message: %s", errMsg)
-				}
+		// Dashboard status badges can use destructive styling (for example FAILED).
+		// Once navigation reaches the dashboard, wait for its content instead of
+		// interpreting those badges as sign-in errors.
+		onDashboard := false
+		if currentURL, err := url.Parse(page.URL()); err == nil {
+			originMatch := pErr == nil && currentURL.Scheme == parsedBase.Scheme && currentURL.Host == parsedBase.Host
+			onDashboard = originMatch && isDashboardPath(currentURL.Path)
+			if onDashboard && isDashboardContentVisible(page) {
+				return nil
 			}
 		}
-
-		// Check if redirected to authenticated dashboard
-		if currentURL, err := url.Parse(page.URL()); err == nil {
-			originMatch := pErr != nil || (currentURL.Scheme == parsedBase.Scheme && currentURL.Host == parsedBase.Host)
-			if originMatch && isDashboardPath(currentURL.Path) && isDashboardContentVisible(page) {
-				return nil
+		if !onDashboard {
+			errorLoc := page.Locator(".text-destructive, [role='alert']")
+			if count, _ := errorLoc.Count(); count > 0 {
+				if visible, _ := errorLoc.First().IsVisible(); visible {
+					errMsg, _ := errorLoc.First().InnerText()
+					if errMsg = strings.TrimSpace(errMsg); errMsg != "" {
+						return fmt.Errorf("sign in failed with message: %s", errMsg)
+					}
+				}
 			}
 		}
 
@@ -81,7 +84,7 @@ func Authenticate(ctx context.Context, page playwright.Page, cfg Config) error {
 	}
 
 	if currentURL, err := url.Parse(page.URL()); err == nil {
-		originMatch := pErr != nil || (currentURL.Scheme == parsedBase.Scheme && currentURL.Host == parsedBase.Host)
+		originMatch := pErr == nil && currentURL.Scheme == parsedBase.Scheme && currentURL.Host == parsedBase.Host
 		if originMatch && isDashboardPath(currentURL.Path) && isDashboardContentVisible(page) {
 			return nil
 		}

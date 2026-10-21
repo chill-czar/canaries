@@ -873,7 +873,7 @@ func TestUILockKeyIsolation(t *testing.T) {
 	}
 }
 
-func TestAuthenticateDelayedRedirect(t *testing.T) {
+func TestAuthenticateDelayedRedirectWithFailedSandbox(t *testing.T) {
 	skipIfPlaywrightUnavailable(t)
 
 	var (
@@ -929,7 +929,7 @@ func TestAuthenticateDelayedRedirect(t *testing.T) {
 			mu.Unlock()
 		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `<!DOCTYPE html><html><body><h1>Sandboxes</h1></body></html>`)
+		fmt.Fprintf(w, `<!DOCTYPE html><html><body><span class="text-destructive">FAILED</span><script>setTimeout(() => document.body.insertAdjacentHTML("afterbegin", "<h1>Sandboxes</h1>"), 1000)</script></body></html>`)
 	})
 
 	server := httptest.NewServer(mux)

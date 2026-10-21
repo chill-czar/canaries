@@ -295,6 +295,7 @@ resource "google_cloud_run_v2_job_iam_member" "scheduler_invoker" {
 }
 
 resource "google_cloud_scheduler_job" "ui_canary" {
+  depends_on  = [google_cloud_run_v2_job_iam_member.scheduler_invoker]
   count       = var.scheduler_enabled ? 1 : 0
   project     = var.project_id
   region      = var.job_region
@@ -302,6 +303,7 @@ resource "google_cloud_scheduler_job" "ui_canary" {
   description = "Runs UI lifecycle canary for ${var.target_name}"
   schedule    = var.scheduler_cron
   time_zone   = "Etc/UTC"
+  paused      = false
 
   http_target {
     uri         = "https://run.googleapis.com/v2/projects/${var.project_id}/locations/${var.job_region}/jobs/${google_cloud_run_v2_job.ui_canary.name}:run"

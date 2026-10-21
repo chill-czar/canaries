@@ -47,6 +47,7 @@ func TestLoadConfigCustom(t *testing.T) {
 	t.Setenv("CANARY_UI_HEADLESS", "false")
 	t.Setenv("CANARY_UI_STEP_TIMEOUT", "20s")
 	t.Setenv("CANARY_UI_VERCEL_PROTECTION_BYPASS", "secret-bypass-token")
+	t.Setenv("CANARY_UI_TEAM_LABEL", " shared · US East ")
 
 	base := config.Config{}
 	cfg, err := LoadConfig(base)
@@ -54,6 +55,9 @@ func TestLoadConfigCustom(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	if cfg.TeamLabel != "shared · US East" {
+		t.Fatalf("unexpected team label: %q", cfg.TeamLabel)
+	}
 	if cfg.ConsoleURL != "http://localhost:3000" {
 		t.Errorf("expected trailing slash trimmed, got %s", cfg.ConsoleURL)
 	}

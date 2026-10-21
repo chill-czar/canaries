@@ -106,6 +106,7 @@ module "ui_canary" {
   target_region           = each.value.target_region
   console_url             = "https://console.superserve.ai"
   sandbox_id_prefix       = "sb-usw-"
+  team_label              = "Canary West · US West"
   image                   = var.ui_canary_image
   scheduler_enabled       = var.ui_scheduler_enabled
   ui_email_secret_name    = "ui-canary-email-${each.key}"

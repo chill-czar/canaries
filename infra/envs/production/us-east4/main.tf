@@ -62,6 +62,7 @@ module "ui_canary" {
   target_region           = "us-east4"
   console_url             = "https://console.superserve.ai"
   sandbox_id_prefix       = "sb-use-"
+  team_label              = "superserve.canary@gmail.com · US East"
   image                   = var.ui_canary_image
   scheduler_enabled       = var.ui_scheduler_enabled
   ui_email_secret_name    = "ui-canary-email-production-us-east4"

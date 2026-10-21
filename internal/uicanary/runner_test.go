@@ -1311,14 +1311,31 @@ func TestSelectTargetTeam(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer browser.Close()
+	t.Run("configured team requires switcher", func(t *testing.T) {
+		page, err := browser.NewPage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer page.Close()
+		if err := page.SetContent(`<h1>Sandboxes</h1>`); err != nil {
+			t.Fatal(err)
+		}
+		if err := selectTargetTeam(page, Config{TeamLabel: "shared"}, 100); err == nil {
+			t.Fatal("missing switcher silently accepted the default team")
+		}
+	})
 	for _, tc := range []struct {
-		name, options, prefix, want string
-		fail                        bool
+		name, options, prefix, label, want string
+		fail                               bool
 	}{
-		{"west", `<div role="option">canary-east · US East</div><div role="option">canary-west · US West</div>`, "sb-usw-", "canary-west · US West", false},
-		{"east", `<div role="option">canary-west · US West</div><div role="option">canary-east · US East</div>`, "sb-use-", "canary-east · US East", false},
-		{"ambiguous", `<div role="option">one · US West</div><div role="option">two · US West</div>`, "sb-usw-", "", true},
-		{"missing", `<div role="option">east · US East</div>`, "sb-usw-", "", true},
+		{"west", `<div role="option">canary-east · US East</div><div role="option">canary-west · US West</div>`, "sb-usw-", "", "canary-west · US West", false},
+		{"east", `<div role="option">canary-west · US West</div><div role="option">canary-east · US East</div>`, "sb-use-", "", "canary-east · US East", false},
+		{"ambiguous", `<div role="option">one · US West</div><div role="option">two · US West</div>`, "sb-usw-", "", "", true},
+		{"named east", `<div role="option">personal · US East</div><div role="option">shared · US East</div>`, "sb-use-", "shared · US East", "shared · US East", false},
+		{"named staging", `<div role="option">personal</div><div role="option">shared</div>`, "", "shared", "shared", false},
+		{"named missing", `<div role="option">shared-extra</div>`, "", "shared", "", true},
+		{"named ambiguous", `<div role="option">shared</div><div role="option">shared</div>`, "", "shared", "", true},
+		{"missing", `<div role="option">east · US East</div>`, "sb-usw-", "", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			page, err := browser.NewPage()
@@ -1329,7 +1346,7 @@ func TestSelectTargetTeam(t *testing.T) {
 			if err := page.SetContent(`<button role="combobox" aria-label="Active team" onclick="document.querySelector('[role=listbox]').hidden=false">default team</button><div role="listbox" hidden>` + tc.options + `</div><script>document.querySelectorAll('[role=option]').forEach(o=>o.onclick=()=>{document.querySelector('button').textContent=o.textContent;document.querySelector('[role=listbox]').hidden=true})</script>`); err != nil {
 				t.Fatal(err)
 			}
-			err = selectTargetTeam(page, Config{ExpectedSandboxIDPrefix: tc.prefix}, 1000)
+			err = selectTargetTeam(page, Config{ExpectedSandboxIDPrefix: tc.prefix, TeamLabel: tc.label}, 1000)
 			if tc.fail {
 				if err == nil {
 					t.Fatal("expected team selection failure")

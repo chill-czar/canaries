@@ -23,6 +23,7 @@ type Config struct {
 	TerminalTimeout         time.Duration
 	VercelProtectionBypass  string
 	ExpectedSandboxIDPrefix string
+	TeamLabel               string
 }
 
 func LoadConfig(baseCfg config.Config) (Config, error) {
@@ -70,6 +71,7 @@ func LoadConfig(baseCfg config.Config) (Config, error) {
 		TerminalTimeout:         terminalTimeout,
 		VercelProtectionBypass:  vercelBypass,
 		ExpectedSandboxIDPrefix: strings.TrimSpace(os.Getenv("CANARY_UI_SANDBOX_ID_PREFIX")),
+		TeamLabel:               strings.TrimSpace(os.Getenv("CANARY_UI_TEAM_LABEL")),
 	}, nil
 }
 

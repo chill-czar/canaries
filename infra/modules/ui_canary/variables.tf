@@ -122,3 +122,9 @@ variable "sandbox_id_prefix" {
   default     = ""
   description = "Expected regional sandbox ID prefix; prevents a different Console team region passing this target"
 }
+
+variable "team_label" {
+  type        = string
+  default     = ""
+  description = "Exact Console team option label, including the region suffix when shown"
+}

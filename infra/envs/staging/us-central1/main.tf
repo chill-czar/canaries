@@ -87,6 +87,7 @@ module "ui_canary" {
   environment                  = "staging"
   target_region                = "us-central1"
   console_url                  = "https://console-staging.superserve.ai"
+  team_label                   = "superserve.canary@gmail.com"
   image                        = var.ui_canary_image
   scheduler_enabled            = var.ui_scheduler_enabled
   ui_email_secret_name         = "ui-canary-email-staging-us-central1"

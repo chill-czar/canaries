@@ -206,6 +206,10 @@ resource "google_cloud_run_v2_job" "ui_canary" {
           value = var.sandbox_id_prefix
         }
         env {
+          name  = "CANARY_UI_TEAM_LABEL"
+          value = var.team_label
+        }
+        env {
           name  = "CANARY_UI_HEADLESS"
           value = "true"
         }

@@ -1330,14 +1330,19 @@ func sandboxTargetCompatible(id, expectedPrefix string, hasRegionalTagger bool) 
 	return err == nil && hasRegionalTagger
 }
 
-// Multi-region logins must use the Console's own team switcher. A single-team
-// account has no switcher; its sandbox ID is still checked before proceeding.
+// An explicit label requires the Console's team switcher. Without one, retain
+// regional selection and single-team behavior; API tagging verifies ownership.
 func selectTargetTeam(page playwright.Page, cfg Config, timeoutMs float64) error {
 	regionLabel := map[string]string{"sb-use-": "US East", "sb-usw-": "US West"}[cfg.ExpectedSandboxIDPrefix]
-	if regionLabel == "" {
+	if regionLabel == "" && cfg.TeamLabel == "" {
 		return nil
 	}
 	trigger := page.Locator("[role='combobox'][aria-label='Active team']")
+	if cfg.TeamLabel != "" {
+		if err := trigger.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible, Timeout: playwright.Float(timeoutMs)}); err != nil {
+			return fmt.Errorf("cannot select configured canary team %q: %w", cfg.TeamLabel, err)
+		}
+	}
 	count, err := trigger.Count()
 	if err != nil {
 		return err
@@ -1353,12 +1358,15 @@ func selectTargetTeam(page playwright.Page, cfg Config, timeoutMs float64) error
 		return err
 	}
 	matches := options.Filter(playwright.LocatorFilterOptions{HasText: regexp.MustCompile(`·\s*` + regexp.QuoteMeta(regionLabel) + `$`)})
+	if cfg.TeamLabel != "" {
+		matches = page.GetByRole(*playwright.AriaRoleOption, playwright.PageGetByRoleOptions{Name: cfg.TeamLabel, Exact: playwright.Bool(true)})
+	}
 	count, err = matches.Count()
 	if err != nil {
 		return err
 	}
 	if count != 1 {
-		return fmt.Errorf("expected exactly one canary team in %s, found %d; configure a dedicated regional canary login or unique regional membership", regionLabel, count)
+		return fmt.Errorf("expected exactly one canary team (label=%q, region=%q), found %d", cfg.TeamLabel, regionLabel, count)
 	}
 	text, err := matches.InnerText()
 	if err != nil {

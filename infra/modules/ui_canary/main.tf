@@ -95,6 +95,18 @@ resource "google_storage_bucket_iam_member" "lock_admin" {
   member = "serviceAccount:${google_service_account.runtime.email}"
 }
 
+resource "google_project_iam_member" "metrics_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+resource "google_project_iam_member" "service_usage_consumer" {
+  project = var.project_id
+  role    = "roles/serviceusage.serviceUsageConsumer"
+  member  = "serviceAccount:${google_service_account.runtime.email}"
+}
+
 resource "google_cloud_run_v2_job" "ui_canary" {
   project             = var.project_id
   name                = local.job_name
@@ -102,6 +114,9 @@ resource "google_cloud_run_v2_job" "ui_canary" {
   labels              = local.labels
   deletion_protection = false
   depends_on = [
+    google_project_iam_member.metrics_writer,
+    google_project_iam_member.service_usage_consumer,
+    google_storage_bucket_iam_member.lock_admin,
     google_secret_manager_secret_iam_member.email_accessor,
     google_secret_manager_secret_iam_member.password_accessor,
     google_secret_manager_secret_iam_member.api_key_accessor,
@@ -185,6 +200,10 @@ resource "google_cloud_run_v2_job" "ui_canary" {
         env {
           name  = "CANARY_UI_CONSOLE_URL"
           value = var.console_url
+        }
+        env {
+          name  = "CANARY_UI_SANDBOX_ID_PREFIX"
+          value = var.sandbox_id_prefix
         }
         env {
           name  = "CANARY_UI_HEADLESS"

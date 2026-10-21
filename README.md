@@ -81,6 +81,7 @@ Per run it:
 | `CANARY_UI_EMAIL` | **Yes** | — | Canary operator login email |
 | `CANARY_UI_PASSWORD` | **Yes** | — | Canary operator login password |
 | `CANARY_UI_VERCEL_PROTECTION_BYPASS` | No | — | Vercel deployment protection bypass secret (injected via `x-vercel-protection-bypass` and `x-vercel-set-bypass-cookie: true` headers; never embed in `CANARY_UI_CONSOLE_URL`) |
+| `CANARY_UI_SANDBOX_ID_PREFIX` | No | — | Expected regional ID prefix (production west: `sb-usw-`, east: `sb-use-`); mismatches fail and trigger cleanup |
 | `CANARY_UI_HEADLESS` | No | `true` | Run browser in headless mode (`true` or `false`) |
 | `CANARY_UI_STEP_TIMEOUT` | No | `45s` | Timeout for UI navigation and status assertion steps |
 | `CANARY_UI_TERMINAL_TIMEOUT` | No | `30s` | Timeout for terminal connection and command execution |
@@ -117,43 +118,38 @@ docker run --rm \
   superserve/ui-canary:latest
 ```
 
-### Cloud Run Deployment & Terraform Infrastructure
+### Cloud Run deployment
 
-The UI canary is defined declaratively in Terraform under `infra/modules/ui_canary` and instantiated per environment (e.g. `infra/envs/staging/us-central1/main.tf`). It provisions:
-- A Cloud Run v2 Job configured with the dedicated Playwright runtime container (`ui_canary_image`), GCS target lease, and OTLP metrics.
-- A Cloud Scheduler job running on a 5-minute cron schedule (`*/5 * * * *`).
-- Secret Manager bindings for operator credentials, Vercel bypass (staging), and the Canary API key for durable ownership metadata tagging.
+The UI canary uses a dedicated Playwright image and runs the full browser lifecycle every five minutes once its scheduler is enabled. Deployment builds the image once and publishes it to both projects. Every Terraform plan and apply passes `ui_canary_image` separately from the API image.
 
-#### Safe Bootstrapping Sequence for New Targets
- 
-When onboarding a brand new target environment, the scheduler is disabled initially (`ui_scheduler_enabled = false`) to prevent automated executions and alerts prior to populating secrets:
- 
-**Step 1: Deploy infrastructure with scheduler disabled**
+| Target | Terraform root | Console | Expected sandbox IDs |
+| --- | --- | --- | --- |
+| `staging-us-central1` | `infra/envs/staging/us-central1` | `https://console-staging.superserve.ai` | Staging account |
+| `production-us-west2` | `infra/envs/production` | `https://console.superserve.ai` | `sb-usw-…` |
+| `production-us-east4` | `infra/envs/production/us-east4` | `https://console.superserve.ai` | `sb-use-…` |
 
-On initial merge, CI applies Terraform with `ui_scheduler_enabled = false` (the default in `infra/envs/staging/us-central1/variables.tf`). This provisions the Cloud Run Job, IAM roles, and empty Secret Manager containers without activating the Cloud Scheduler job.
+Each job has its own runtime identity, GCS lease, login secrets, and regional API key for ownership tagging and janitor cleanup. Production does not bind a Vercel bypass secret. UI alert policies are a follow-up.
 
-**Step 2: Populate Secret Manager versions out-of-band**
+#### First deployment
+
+1. Deploy all roots with `ui_scheduler_enabled = false` (the committed bootstrap default). This creates the jobs, IAM bindings, and empty login secret containers without starting scheduled executions.
+2. Populate `ui-canary-email-<target>` and `ui-canary-password-<target>` in the target project. Staging also requires `ui-canary-vercel-bypass-staging-us-central1`. Keep secret values out of Terraform and shell history; upload from a protected local file or through Secret Manager. The existing `api-canary-key-<target>` must belong to the **same team** as the UI login. Do not overwrite an existing API key merely to configure the UI canary.
+3. Use a dedicated login with billing enabled and permission to create sandboxes. For a multi-region login, the canary selects the unique team labeled `US East` or `US West` through the Console team switcher. Multiple matching teams fail before sandbox creation; a single-team login uses its default team. The Console selects its region from the active team, not from the Cloud Run location. Production jobs reject a sandbox ID from the wrong region and attempt UI cleanup instead of reporting that region healthy.
+4. Run each job and inspect its result:
+
 ```bash
-PROJECT_ID="rayai-dev"
-echo -n "canary-operator@superserve.ai" | gcloud secrets versions add ui-canary-email-staging-us-central1 --project="$PROJECT_ID" --data-file=-
-echo -n "operator-password-here" | gcloud secrets versions add ui-canary-password-staging-us-central1 --project="$PROJECT_ID" --data-file=-
-echo -n "vercel-bypass-secret-here" | gcloud secrets versions add ui-canary-vercel-bypass-staging-us-central1 --project="$PROJECT_ID" --data-file=-
-# If this is a fresh target without an existing API canary key:
-echo -n "superserve-api-key-here" | gcloud secrets versions add api-canary-key-staging-us-central1 --project="$PROJECT_ID" --data-file=-
+gcloud run jobs execute ui-canary-staging-us-central1 --project rayai-dev --region us-central1 --wait
+gcloud run jobs execute ui-canary-production-us-west2 --project rayai-prod --region us-west2 --wait
+gcloud run jobs execute ui-canary-production-us-east4 --project rayai-prod --region us-east4 --wait
 ```
 
-**Step 3: Manually execute and verify the Cloud Run Job**
-```bash
-gcloud run jobs execute ui-canary-staging-us-central1 \
-  --project rayai-dev \
-  --region us-central1 \
-  --wait
-```
-Inspect the execution logs to confirm authentication, sandbox creation, terminal execution, and cleanup succeeded.
+5. After successful live runs, commit `ui_scheduler_enabled = true` in each root's `variables.tf`. Normal deployments then preserve the five-minute schedule. Verify consecutive scheduled executions finish successfully and delete their sandboxes.
 
-**Step 4: Enable the Cloud Scheduler job**
+The jobs emit step metrics and execution logs. Failure screenshots currently remain on the container's temporary filesystem; durable artifact storage and alerting are separate follow-ups.
 
-Submit a follow-up commit updating `infra/envs/staging/us-central1/variables.tf` to set `default = true` for `ui_scheduler_enabled`. Once merged, normal CI deployments will henceforth maintain the scheduler as durably enabled.
+#### Browser regression tests
+
+CI installs `playwright-core@1.57.0` from npm, matching `playwright-go v0.5700.1` and the Docker image. This avoids the Go installer's retired driver-download mirrors. `CANARY_REQUIRE_BROWSER_TESTS=true` turns a missing driver or Chromium into a test failure instead of silently skipping browser coverage.
 
 ## Target Inventory
 

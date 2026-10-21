@@ -13,15 +13,16 @@ import (
 )
 
 type Config struct {
-	BaseConfig             config.Config
-	ConsoleURL             string
-	Email                  string
-	Password               string
-	Headless               bool
-	ArtifactsDir           string
-	StepTimeout            time.Duration
-	TerminalTimeout        time.Duration
-	VercelProtectionBypass string
+	BaseConfig              config.Config
+	ConsoleURL              string
+	Email                   string
+	Password                string
+	Headless                bool
+	ArtifactsDir            string
+	StepTimeout             time.Duration
+	TerminalTimeout         time.Duration
+	VercelProtectionBypass  string
+	ExpectedSandboxIDPrefix string
 }
 
 func LoadConfig(baseCfg config.Config) (Config, error) {
@@ -59,15 +60,16 @@ func LoadConfig(baseCfg config.Config) (Config, error) {
 	vercelBypass := strings.TrimSpace(os.Getenv("CANARY_UI_VERCEL_PROTECTION_BYPASS"))
 
 	return Config{
-		BaseConfig:             baseCfg,
-		ConsoleURL:             consoleURL,
-		Email:                  email,
-		Password:               password,
-		Headless:               headless,
-		ArtifactsDir:           artifactsDir,
-		StepTimeout:            stepTimeout,
-		TerminalTimeout:        terminalTimeout,
-		VercelProtectionBypass: vercelBypass,
+		BaseConfig:              baseCfg,
+		ConsoleURL:              consoleURL,
+		Email:                   email,
+		Password:                password,
+		Headless:                headless,
+		ArtifactsDir:            artifactsDir,
+		StepTimeout:             stepTimeout,
+		TerminalTimeout:         terminalTimeout,
+		VercelProtectionBypass:  vercelBypass,
+		ExpectedSandboxIDPrefix: strings.TrimSpace(os.Getenv("CANARY_UI_SANDBOX_ID_PREFIX")),
 	}, nil
 }
 

@@ -339,12 +339,18 @@ func skipIfPlaywrightUnavailable(t *testing.T) {
 	t.Helper()
 	pw, err := playwright.Run()
 	if err != nil {
+		if os.Getenv("CANARY_REQUIRE_BROWSER_TESTS") == "true" {
+			t.Fatalf("required Playwright driver unavailable: %v", err)
+		}
 		t.Skipf("skipping UI canary test: playwright driver unavailable: %v", err)
 		return
 	}
 	defer pw.Stop()
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Headless: playwright.Bool(true)})
 	if err != nil {
+		if os.Getenv("CANARY_REQUIRE_BROWSER_TESTS") == "true" {
+			t.Fatalf("required Chromium unavailable: %v", err)
+		}
 		t.Skipf("skipping UI canary test: chromium browser unavailable: %v", err)
 		return
 	}
@@ -1268,5 +1274,79 @@ func TestCreateSandboxStepMetricReadinessFailure(t *testing.T) {
 	}
 	if createSandboxFailureCount != 1 {
 		t.Errorf("expected 1 create_sandbox failure metric, got %d", createSandboxFailureCount)
+	}
+}
+
+func TestWrongRegionFailsAndCleansUp(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+	state := &mockServerState{}
+	server := setupMockConsoleServer(state)
+	defer server.Close()
+	cfg := newMockRunnerConfig(server.URL, "")
+	cfg.ExpectedSandboxIDPrefix = "sb-usw-"
+	runner := Runner{Config: cfg, Locker: lock.NoopLock{}, Metrics: metrics.NoopProvider{}}
+	err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "does not match target") {
+		t.Fatalf("expected wrong-region failure, got %v", err)
+	}
+	state.Lock()
+	defer state.Unlock()
+	if !state.deletedSandbox {
+		t.Fatal("wrong-region sandbox was not cleaned up")
+	}
+	if state.terminalCommandExecuted || state.pausedSandbox || state.resumedSandbox {
+		t.Fatal("lifecycle continued after detecting the wrong region")
+	}
+}
+
+func TestSelectTargetTeam(t *testing.T) {
+	skipIfPlaywrightUnavailable(t)
+	pw, err := playwright.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pw.Stop()
+	browser, err := pw.Chromium.Launch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+	for _, tc := range []struct {
+		name, options, prefix, want string
+		fail                        bool
+	}{
+		{"west", `<div role="option">canary-east · US East</div><div role="option">canary-west · US West</div>`, "sb-usw-", "canary-west · US West", false},
+		{"east", `<div role="option">canary-west · US West</div><div role="option">canary-east · US East</div>`, "sb-use-", "canary-east · US East", false},
+		{"ambiguous", `<div role="option">one · US West</div><div role="option">two · US West</div>`, "sb-usw-", "", true},
+		{"missing", `<div role="option">east · US East</div>`, "sb-usw-", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page, err := browser.NewPage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer page.Close()
+			if err := page.SetContent(`<button role="combobox" aria-label="Active team" onclick="document.querySelector('[role=listbox]').hidden=false">default team</button><div role="listbox" hidden>` + tc.options + `</div><script>document.querySelectorAll('[role=option]').forEach(o=>o.onclick=()=>{document.querySelector('button').textContent=o.textContent;document.querySelector('[role=listbox]').hidden=true})</script>`); err != nil {
+				t.Fatal(err)
+			}
+			err = selectTargetTeam(page, Config{ExpectedSandboxIDPrefix: tc.prefix}, 1000)
+			if tc.fail {
+				if err == nil {
+					t.Fatal("expected team selection failure")
+				}
+				text, _ := page.Locator("button").InnerText()
+				if text != "default team" {
+					t.Fatal("ambiguous/missing team changed selection")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			text, _ := page.Locator("button").InnerText()
+			if text != tc.want {
+				t.Fatalf("selected %q, want %q", text, tc.want)
+			}
+		})
 	}
 }

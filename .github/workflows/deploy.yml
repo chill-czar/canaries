@@ -197,6 +197,12 @@ jobs:
           name: api-canary-image-${{ github.sha }}
           path: /tmp
 
+      - name: Download prebuilt UI canary image
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-canary-image-${{ github.sha }}
+          path: /tmp
+
       # The production image is stored once in the existing us-central1
       # Artifact Registry and may be deployed by Terraform to multiple regions.
       - name: Configure Docker auth
@@ -217,6 +223,16 @@ jobs:
 
           echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Load and push production UI image
+        id: ui_image
+        run: |
+          set -euo pipefail
+          gzip -dc /tmp/ui-canary-image.tar.gz | docker load
+          IMAGE="us-central1-docker.pkg.dev/rayai-prod/superserve/ui-canary"
+          docker tag ui-canary:${GITHUB_SHA} "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
@@ -226,7 +242,11 @@ jobs:
           set -euo pipefail
           cd infra/envs/production
           terraform init -input=false
-          terraform apply             -input=false             -auto-approve             -var="image=${{ steps.image.outputs.image }}"
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            -var="image=${{ steps.image.outputs.image }}" \
+            -var="ui_canary_image=${{ steps.ui_image.outputs.image }}"
 
       # East4 is isolated in its own root because it does not use VPC access.
       - name: Apply production east
@@ -234,4 +254,8 @@ jobs:
           set -euo pipefail
           cd infra/envs/production/us-east4
           terraform init -input=false
-          terraform apply             -input=false             -auto-approve             -var="image=${{ steps.image.outputs.image }}"
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            -var="image=${{ steps.image.outputs.image }}" \
+            -var="ui_canary_image=${{ steps.ui_image.outputs.image }}"

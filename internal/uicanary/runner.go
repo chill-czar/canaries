@@ -132,7 +132,7 @@ func (r Runner) Run(ctx context.Context) error {
 			return fmt.Errorf("acquire lock: %w", err)
 		}
 		if outcome == lock.OutcomeAlreadyRunning {
-			r.metricsProvider().RecordOverlapSkip(ctx, env, region, target)
+			r.metricsProvider().RecordOverlapSkip(ctx, env, region, target, "ui-lifecycle")
 			log.Info().Str("target", target).Msg("UI canary skipped because another run holds the target lease")
 			return nil
 		}
@@ -355,6 +355,14 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 	mp.RecordStep(ctx, env, region, target, scenario, "authenticate", "success", r.now().Sub(authStart))
 
 	// Step 2: Create Sandbox
+	if err := selectTargetTeam(page, r.Config, stepTimeoutMs); err != nil {
+		mp.RecordStep(ctx, env, region, target, scenario, "select_team", "failure", 0)
+		captureArtifacts("select_team")
+		res.Err = fmt.Errorf("select target team: %w", err)
+		res.FailedStep = "select_team"
+		return res
+	}
+
 	createStart := r.now()
 	log.Info().Msg("UI step: create_sandbox")
 	sandboxName := fmt.Sprintf("ui-canary-%d", r.now().Unix())
@@ -377,6 +385,16 @@ func (r Runner) runLifecycle(ctx context.Context, runID string) (res RunResult) 
 		captureArtifacts("create_sandbox")
 		res.Err = fmt.Errorf("create sandbox: %w", err)
 		res.FailedStep = "create_sandbox"
+		return res
+	}
+
+	// The Console chooses a region through its active team, independently of
+	// the Cloud Run job location. Never report a different region as healthy.
+	if prefix := r.Config.ExpectedSandboxIDPrefix; prefix != "" && !strings.HasPrefix(activeID, prefix) {
+		mp.RecordStep(ctx, env, region, target, scenario, "validate_target", "failure", 0)
+		captureArtifacts("validate_target")
+		res.Err = fmt.Errorf("created sandbox %s does not match target %s (expected ID prefix %s); check the canary account's active team", activeID, target, prefix)
+		res.FailedStep = "validate_target"
 		return res
 	}
 
@@ -1301,4 +1319,56 @@ func checkCreationError(tracker *sandboxIDTracker, page playwright.Page) error {
 		return fmt.Errorf("create sandbox validation error: %s", valErr)
 	}
 	return nil
+}
+
+// Multi-region logins must use the Console's own team switcher. A single-team
+// account has no switcher; its sandbox ID is still checked before proceeding.
+func selectTargetTeam(page playwright.Page, cfg Config, timeoutMs float64) error {
+	regionLabel := map[string]string{"sb-use-": "US East", "sb-usw-": "US West"}[cfg.ExpectedSandboxIDPrefix]
+	if regionLabel == "" {
+		return nil
+	}
+	trigger := page.Locator("[role='combobox'][aria-label='Active team']")
+	count, err := trigger.Count()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	if err := trigger.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(timeoutMs)}); err != nil {
+		return err
+	}
+	options := page.GetByRole(*playwright.AriaRoleOption)
+	if err := options.First().WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible, Timeout: playwright.Float(timeoutMs)}); err != nil {
+		return err
+	}
+	matches := options.Filter(playwright.LocatorFilterOptions{HasText: regexp.MustCompile(`·\s*` + regexp.QuoteMeta(regionLabel) + `$`)})
+	count, err = matches.Count()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return fmt.Errorf("expected exactly one canary team in %s, found %d; configure a dedicated regional canary login or unique regional membership", regionLabel, count)
+	}
+	text, err := matches.InnerText()
+	if err != nil {
+		return err
+	}
+	if err := matches.Click(playwright.LocatorClickOptions{Timeout: playwright.Float(timeoutMs)}); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if message := checkForUIError(page); message != "" {
+			return fmt.Errorf("team switch rejected: %s", message)
+		}
+		selected, _ := trigger.InnerText()
+		disabled, _ := trigger.IsDisabled()
+		if strings.TrimSpace(selected) == strings.TrimSpace(text) && !disabled {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("Console did not confirm active team %q", strings.TrimSpace(text))
 }

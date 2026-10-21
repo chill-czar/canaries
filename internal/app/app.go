@@ -56,6 +56,7 @@ func Run(ctx context.Context, args []string) (err error) {
 	case config.ModeLifecycle, config.ModeTemplate, config.ModeSnapshot:
 		httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
 		apiClient := canaryapi.NewClient(httpClient, cfg.APIBaseURL, cfg.APIKey, cfg.PreviewDomain)
+
 		locker, closeFn, err := newLocker(ctx, cfg)
 		if err != nil {
 			return err
@@ -94,7 +95,7 @@ func Run(ctx context.Context, args []string) (err error) {
 		defer closeFn()
 
 		// Wire API client as sandbox tagger when an API key is configured.
-		// Tagging is best-effort: the run proceeds even if the API key is absent.
+		// Cloud Run requires credentials; local runs may omit the tagger.
 		var tagger uicanary.SandboxTagger
 		if cfg.APIKey != "" {
 			httpClient := &http.Client{Timeout: cfg.HTTPTimeout}

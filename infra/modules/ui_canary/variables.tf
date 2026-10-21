@@ -116,3 +116,9 @@ variable "vpc_tags" {
   default     = null
   description = "VPC network tags for direct VPC egress"
 }
+
+variable "sandbox_id_prefix" {
+  type        = string
+  default     = ""
+  description = "Expected regional sandbox ID prefix; prevents a different Console team region passing this target"
+}

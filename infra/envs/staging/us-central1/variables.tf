@@ -18,9 +18,8 @@ variable "load_runner_image" {
 }
 
 variable "ui_canary_image" {
-  description = "Container image for the UI canary (defaults to var.image if null)"
   type        = string
-  default     = null
+  description = "Dedicated Playwright UI canary image"
 }
 
 variable "ui_scheduler_enabled" {

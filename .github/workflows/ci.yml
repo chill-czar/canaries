@@ -14,6 +14,7 @@ jobs:
       id-token: write
     env:
       TF_VAR_deployment_service_account_email: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      PLAYWRIGHT_DRIVER_PATH: ${{ runner.temp }}/playwright-driver
     steps:
       - uses: actions/checkout@v4
 
@@ -31,15 +32,23 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install Playwright and Chromium
         run: |
           set -euo pipefail
-          go run github.com/playwright-community/playwright-go/cmd/playwright install --with-deps chromium
+          mkdir -p "$PLAYWRIGHT_DRIVER_PATH"
+          npm pack playwright-core@1.57.0 --pack-destination "$PLAYWRIGHT_DRIVER_PATH" --silent
+          tar -xzf "$PLAYWRIGHT_DRIVER_PATH/playwright-core-1.57.0.tgz" -C "$PLAYWRIGHT_DRIVER_PATH"
+          ln -s "$(command -v node)" "$PLAYWRIGHT_DRIVER_PATH/node"
+          node "$PLAYWRIGHT_DRIVER_PATH/package/cli.js" install --with-deps chromium
 
       - name: Go test
         run: |
           set -euo pipefail
-          go test ./...
+          CANARY_REQUIRE_BROWSER_TESTS=true go test -race ./...
 
       - name: Canary alert filter regression
         run: python3 -m unittest discover -s infra/modules/canary_target/tests -v
@@ -136,10 +145,9 @@ jobs:
           cd "${{ matrix.workdir }}"
           terraform init -input=false
 
-          plan_args=("-var=image=api-canary:pr-${GITHUB_SHA}")
+          plan_args=("-var=image=api-canary:pr-${GITHUB_SHA}" "-var=ui_canary_image=ui-canary:pr-${GITHUB_SHA}")
           if [[ "${{ matrix.name }}" == "staging" ]]; then
             plan_args+=("-var=load_runner_image=api-canary:pr-${GITHUB_SHA}")
-            plan_args+=("-var=ui_canary_image=ui-canary:pr-${GITHUB_SHA}")
           fi
 
           set +e
